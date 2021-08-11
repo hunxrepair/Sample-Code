@@ -1,0 +1,67 @@
+--[[
+	Written by hunxrepair
+	2021/06/20
+]]
+local RepStorage		= game:GetService("ReplicatedStorage")
+local Util				= require(RepStorage:WaitForChild("Scripts"):WaitForChild("Utilities"))
+local Config			= require(Util("WFC", {RepStorage, "Scripts", "Configurations"}))
+
+local Player			= game.Players.LocalPlayer
+local Connections		= {}
+local GameStats			= RepStorage:WaitForChild("GameStats")
+local EffectName, EffectConfig = Util("GetAssetConfig", {Type = "Effects", Name = script.Name})
+
+
+local function EnableMultipleJumps()
+	local JumpRequests = {0, 0}
+	local Anim, AnimObj = Util("NewAnim", {
+		Action = "Load",
+		Humanoid = Player.Character:WaitForChild("Humanoid"),
+		Properties = {AnimationId = 7171529063, Parent = Player.Character}
+	})
+
+	if Connections["JumpRequest"] then
+		Connections["JumpRequest"]:Disconnect()
+	end
+	Connections["JumpRequest"] = game:GetService("UserInputService").JumpRequest:Connect(function()
+		for Num = #JumpRequests, 2, -1 do
+			if os.clock() - JumpRequests[Num] > 1 and os.clock() - JumpRequests[Num - 1] > 0.15 and os.clock() - JumpRequests[Num - 1] < 0.6 then
+				JumpRequests[Num] = os.clock()
+				Player.Character.HumanoidRootPart.Velocity = Vector3.new(Player.Character.HumanoidRootPart.Velocity.X, EffectConfig.JumpBoost, Player.Character.HumanoidRootPart.Velocity.Z)
+				Anim:Play()	
+			end
+		end
+	end)
+
+	Connections["Jump"] = Player.Character:WaitForChild("Humanoid"):GetPropertyChangedSignal("Jump"):Connect(function()
+		if Player.Character.Humanoid.Jump == true then
+			JumpRequests[1] = os.clock()
+		end
+	end)
+end
+
+local function ReturnFunction()
+	EnableMultipleJumps()
+	Connections["CharacterAdded"] = Player.CharacterAdded:Connect(function()
+		if GameStats["Triple Jump"].Value == true then return end
+		EnableMultipleJumps()
+	end)
+
+	Connections["StatChange"] = GameStats[EffectName].Changed:Connect(function()
+		for i,Con in pairs(Connections) do
+			Con:Disconnect()
+			Con = nil
+		end
+	end)
+	
+	Connections["TripleJumpChanged"] = GameStats["Triple Jump"].Changed:Connect(function()
+		if GameStats["Triple Jump"].Value == false then return end
+		for i,Con in pairs(Connections) do
+			Con:Disconnect()
+			Con = nil
+		end
+	end)
+end
+
+return ReturnFunction
+
