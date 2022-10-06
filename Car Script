@@ -1,0 +1,257 @@
+local Player = game:GetService("Players").LocalPlayer
+local HRP = Player.Character.HumanoidRootPart
+local Humanoid = Player.Character.Humanoid
+local Car = script:WaitForChild("Vehicle").Value
+local Camera = game:GetService("Workspace").CurrentCamera
+
+local Connections = {}
+local Running = true
+local CarGui = game.ReplicatedStorage.Assets.Guis.CarUI:Clone()
+
+local Util = require(game.ReplicatedStorage.Scripts.Utilities)
+local CarName, CarConfig = Util("GetConfig", "Vehicles", Car.Name)
+
+
+Connections["Died"] = Humanoid.Died:Connect(function()
+	Running = false
+end)
+Connections["AncestryChanged"] = HRP.AncestryChanged:Connect(function()
+	Running = false
+end)
+Connections["Unseated"] = Humanoid:GetPropertyChangedSignal("SeatPart"):Connect(function()
+	Running = false
+end)
+
+local Speed = 0
+local Steer = 0
+
+local LastPosition, IdleCount, LastSpeed = Vector3.new(), 0, 0
+local function Flip()
+	CarGui.Flip.Visible = false
+	IdleCount = 0
+
+	local BG = Instance.new("BodyGyro")
+	game.Debris:AddItem(BG, 2)
+	BG.P = 1000000
+	BG.D = 500
+	BG.MaxTorque = CarConfig.Mass * Vector3.new(100, 0, 100)
+	BG.CFrame = CFrame.new()
+	BG.Parent = Car.Chassis.Mass
+
+	local BP = Instance.new("BodyPosition")
+	game.Debris:AddItem(BP, 2)
+	BP.P = 5000
+	BP.D = 2000
+	BP.MaxForce = CarConfig.Mass * Vector3.new(0, 15000, 0)
+	BP.Position = Car.Chassis.Platform.Position + Vector3.new(0, 15, 0) + Car.Chassis.Platform.CFrame.LookVector * 30
+	BP.Parent = Car.Chassis.Mass
+
+	task.wait(1)
+	BP.MaxForce = CarConfig.Mass * Vector3.new(7000, 15000, 7000)
+	task.wait(1)
+end
+
+local function FlipCheck()
+	while true do
+		if HRP.Parent == nil or Humanoid.Parent == nil then Running = false end
+		if Car == nil or Car.Parent == nil then Running = false end
+		if Running == false then break end
+		
+		if (Car.Chassis.Platform.Position - LastPosition).Magnitude < 5 then
+			IdleCount += 1
+			
+			if IdleCount >= 2 then
+				local RaycastParams = RaycastParams.new()
+				RaycastParams.IgnoreWater = true
+				RaycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+				RaycastParams.FilterDescendantsInstances = {Car, Player.Character}
+				
+				local AngleX = Car.Chassis.Platform.Orientation.X
+				local AngleZ = Car.Chassis.Platform.Orientation.Z
+				if AngleX > 75 or AngleX < -75 or AngleZ > 75 or AngleZ < -75 then
+					Flip()
+				else
+					local Flipped = false
+					if AngleX > 10 or AngleX < -10 or AngleZ > 10 or AngleZ < -10 then
+						local RaycastCFrame = Car.Chassis.Platform.CFrame * CFrame.new(0, 0, -Car.Chassis.Platform.Size.Z/2)
+						local RaycastResult = game:GetService("Workspace"):Raycast(RaycastCFrame.Position, RaycastCFrame.LookVector * 10, RaycastParams)
+
+						if RaycastResult ~= nil then
+							Flipped = true
+							Flip()
+						end
+					end
+					
+					if Flipped == false then
+						-- Check if the front wheels arne't on the ground
+						local RaycastCFrame = (Car.Chassis.Platform.CFrame - Car.Chassis.Platform.Position) + Car.Body.WheelFL.PhysicalWheel.Position
+						local RaycastResult = game:GetService("Workspace"):Raycast(RaycastCFrame.Position, RaycastCFrame.UpVector * -5, RaycastParams)
+
+						if RaycastResult == nil then
+							Flipped = true
+							Flip()
+
+							-- Check if the rear wheels arne't on the ground
+						else
+							local RaycastCFrame = (Car.Chassis.Platform.CFrame - Car.Chassis.Platform.Position) + Car.Body.WheelRR.PhysicalWheel.Position
+							local RaycastResult = game:GetService("Workspace"):Raycast(RaycastCFrame.Position, RaycastCFrame.UpVector * -5, RaycastParams)
+							if RaycastResult == nil then
+								Flipped = true
+								Flip()
+							end
+						end
+					end
+					
+					if Flipped == false then
+						CarGui.Flip.Visible = true
+					end
+				end
+			end
+			
+		else
+			IdleCount = 0
+		end
+		
+		LastPosition = Car.Chassis.Platform.Position
+		LastSpeed = Speed
+		task.wait(1)
+	end
+end
+
+CarGui.Honk.MouseButton1Click:Connect(function()
+	Car.Chassis.Platform.HornSound:Play()
+end)
+CarGui.Flip.MouseButton1Click:Connect(function()
+	Flip()
+end)
+CarGui.Flip.Visible = false
+CarGui.Parent = Player.PlayerGui
+
+local IdleAnim, IdleObj = Util("NewAnim", "Load", Humanoid, {
+	Name = "IdleAnim",
+	AnimationId = "rbxassetid://8522391385",
+	Parent = Humanoid,
+})
+IdleAnim:Play()
+local LeaningLeftAnim, LeaningLeftObj = Util("NewAnim", "Load", Humanoid, {
+	Name = "LeftLeaningAnim",
+	AnimationId = "rbxassetid://8522201863",
+	Parent = Humanoid,
+})
+local LeaningRightAnim, LeaningRightObj = Util("NewAnim", "Load", Humanoid, {
+	Name = "LeaningRightAnim",
+	AnimationId = "rbxassetid://8522206428",
+	Parent = Humanoid,
+})
+
+local function Accelerate()
+	Speed = math.clamp(Speed + Car:GetAttribute("Acceleration"), 0, Car:GetAttribute("MaxSpeed"))
+end
+local function Decelerate(Reverse)
+	Speed = math.clamp(Speed - Car:GetAttribute("Deceleration"), Reverse == true and Car:GetAttribute("MaxReverseSpeed") or 0, Car:GetAttribute("MaxSpeed"))
+end
+
+local SteeringWheelJoint = Car.Chassis.Platform:FindFirstChild("SteeringWheelJoint")
+local function Update()
+	local SpeedPercent = Speed / Car:GetAttribute("MaxSpeed")
+	
+	Car.Chassis.Platform.CylindricalRL.AngularVelocity = Speed
+	Car.Chassis.Platform.CylindricalRR.AngularVelocity = -Speed
+	Car.Chassis.Platform.CylindricalFL.AngularVelocity = Speed
+	Car.Chassis.Platform.CylindricalFR.AngularVelocity = -Speed
+	
+	local SteerGoal = -Car.Body.DriverSeat.SteerFloat * Car:GetAttribute("MaxSteering")
+	Steer += (SteerGoal - Steer) * 0.15
+	local SteerPercent = (Steer) / Car:GetAttribute("MaxSteering")
+	Car.Chassis.Platform.AttachmentFL.Orientation = Vector3.new(0, 180 + Steer, -90)
+	Car.Chassis.Platform.AttachmentFR.Orientation = Vector3.new(0, Steer, -90)
+	
+	if SteeringWheelJoint then
+		if SteerGoal < 0 then
+			LeaningLeftAnim:Stop(0)
+			LeaningRightAnim:Play(0.2)
+		elseif SteerGoal > 0 then
+			LeaningLeftAnim:Play(0.2)
+			LeaningRightAnim:Stop(0)
+		else
+			LeaningLeftAnim:Stop()
+			LeaningRightAnim:Stop()
+		end
+	
+		SteeringWheelJoint.CurrentAngle = 0.5 * SteerPercent
+	end
+	
+	if Car.Body.DriverSeat.Throttle ~= 0 then
+		if Car.Body.DriverSeat.Throttle > 0 then
+			Accelerate()	
+		else
+			Decelerate(true)
+		end
+	else
+		Decelerate(false)
+	end
+	
+	local VelocitySpeed = Car.Chassis.Platform.Velocity.Magnitude
+	if VelocitySpeed > 15 then
+		CarGui.Flip.Visible = false
+		local DesiredFOV = 70 + CarConfig["MaxFOV"] * ((Speed - 15) / (Car:GetAttribute("MaxSpeed") - 15))
+		Camera.FieldOfView = math.clamp(DesiredFOV < Camera.FieldOfView and Camera.FieldOfView - 0.2 or Camera.FieldOfView + 0.2, 70, 90)
+	else
+		Camera.FieldOfView = math.clamp(Camera.FieldOfView - 0.4, 70, 90)
+	end
+	
+	Car.Chassis.Platform.RunningSound.PlaybackSpeed = math.min(6, (math.exp(VelocitySpeed / Car:GetAttribute("MaxSpeed")) - 1))
+	if VelocitySpeed > 35 then
+		Car.Chassis.Platform.WindSound.PlaybackSpeed = math.min(1, (math.exp((VelocitySpeed - 35) / (Car:GetAttribute("MaxSpeed") - 35)) - 1) / 5)
+	else
+		Car.Chassis.Platform.WindSound.PlaybackSpeed = 0
+	end
+	
+	task.wait()
+end
+
+Car.Chassis.Platform.StartSound:Play()
+Car.Chassis.Platform.RunningSound.Volume = 0.1
+Car.Chassis.Platform.RunningSound:Play()
+Car.Chassis.Platform.WindSound.Volume = 0.4
+Car.Chassis.Platform.WindSound:Play()
+task.spawn(FlipCheck)
+while true do
+	if HRP.Parent == nil or Humanoid.Parent == nil then Running = false end
+	if Car == nil or Car.Parent == nil then Running = false end
+	if Running == false then break end
+	
+	local S, E = pcall(Update)
+	if S == false then
+		print(E)
+		print(debug.traceback())
+		wait()
+	end
+end
+
+-- Terminating script
+for i,Con in pairs(Connections) do
+	Con:Disconnect()
+	Con = nil
+end
+
+if Car and Car.Parent then
+	Car.Chassis.Platform.StopSound:Play()
+	
+	Car.Chassis.Platform.CylindricalRL.AngularVelocity = 0
+	Car.Chassis.Platform.CylindricalRR.AngularVelocity = 0
+	Car.Chassis.Platform.CylindricalFL.AngularVelocity = 0
+	Car.Chassis.Platform.CylindricalFR.AngularVelocity = 0
+end
+
+IdleAnim:Stop()
+LeaningLeftAnim:Stop()
+LeaningRightAnim:Stop()
+
+IdleObj:Destroy()
+LeaningLeftObj:Destroy()
+LeaningRightObj:Destroy()
+
+CarGui:Destroy()
+
+
