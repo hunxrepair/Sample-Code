@@ -1,0 +1,309 @@
+-- Written by hunxrepair
+-- 2022/03/26
+
+
+local Player			= game:GetService("Players").LocalPlayer
+local RepStorage		= game:GetService("ReplicatedStorage")
+local Util				= require(RepStorage:WaitForChild("Scripts"):WaitForChild("Utilities"))
+local Config			= require(Util("WFC", RepStorage, "Scripts", "Configurations"))
+local GuiEffects		= require(RepStorage:WaitForChild("Scripts"):WaitForChild("GuiEffects"))
+
+local MainUI			= Util("WFC", Player, "PlayerGui", "MainUI")
+local Gui				= script.Parent
+local Connections		= {}
+local Debris			= {}
+local SelectedCategory	= "Gear"
+
+local HTTPS				= game:GetService("HttpService")
+
+Player:WaitForChild("Data", 30)
+
+
+-- Allows the user to interact with GUI pieces
+local function GuiInteract(GuiObj, ClickFunction, ...)
+	GuiEffects("OnHover", GuiObj, ...)
+	GuiEffects("OnClick", GuiObj, ...)
+
+	return GuiObj.MouseButton1Click:Connect(function()
+		ClickFunction(GuiObj)
+	end)
+end
+
+
+-- Close the GUI
+function CloseGui()
+	Gui:SetAttribute("State", "Closing")
+	for i, Con in pairs(Connections) do
+		Con:Disconnect()
+		Con = nil
+	end
+	Connections = {}
+	for i,Obj in pairs(Debris) do
+		Obj:Destroy()
+	end
+	Debris = {}
+	
+	Player.LocalCache:ClearAllChildren()
+	MainUI.Front.LeftButtons.Inventory.Image = "rbxassetid://8923621143"
+	GuiEffects("MenuClose", Gui)
+	Gui:SetAttribute("State", "Closed")
+end
+
+-- Open the GUI
+function OpenGui()
+	Gui:SetAttribute("State", "Opening")
+	
+	MainUI.Front.LeftButtons.Inventory.Image = "rbxassetid://8923684497"
+	
+	Connections["Gears"] = Player.Data.Gears.Changed:Connect(function()
+		LoadItems(true)
+	end)
+	Connections["Vehicles"] = Player.Data.Vehicles.Changed:Connect(function()
+		LoadItems(true)
+	end)
+	Connections["Decorations"] = Player.Data.Decorations.Changed:Connect(function()
+		LoadItems(true)
+	end)
+	Connections["GearsEquipped"] = Player.Data.GearsEquipped.Changed:Connect(function()
+		LoadItems(true)
+	end)
+	Connections["VehicleEquipped"] = Player.Data.VehicleEquipped.Changed:Connect(function()
+		LoadItems(true)
+	end)
+	
+	LoadItems()
+	GuiEffects("MenuOpen", Gui)
+	Gui:SetAttribute("State", "Open")
+end
+
+
+Gui:SetAttribute("State", "Closed")
+MainUI.MenuEvent.Event:Connect(function(TargetName, Action, ...)
+	if TargetName ~= Gui.Name and TargetName ~= "All" then return end
+	if Action == "Open" then
+		if Gui:GetAttribute("State") == "Closed" then
+			MainUI.MenuEvent:Fire("All", "Close")
+			OpenGui()
+		end
+	elseif Action == "Close" then
+		if Gui:GetAttribute("State") == "Open" then
+			CloseGui()
+		end
+	elseif Action == "Toggle" then
+		if Gui:GetAttribute("State") == "Closed" then
+			MainUI.MenuEvent:Fire("All", "Close")
+			OpenGui()
+		elseif Gui:GetAttribute("State") == "Open" then
+			CloseGui()
+		end
+	end
+end)
+
+
+
+function ClearItems()
+	for i,GuiObj in pairs(Gui.Bg.List:GetChildren()) do
+		if GuiObj:IsA("GuiObject") == false then continue end
+		GuiObj:Destroy()
+	end
+end
+
+local References = {
+	["Gear"] = "Gears",
+	["Vehicle"] = "Vehicles",
+	["Decoration"] = "Decorations",
+	["Food"] = "Gears",
+	["Money"] = "Money",
+}
+
+function LoadItems(Refresh)
+	if Refresh ~= true then
+		ClearItems()
+	end
+	
+	for i,Button in pairs(Gui.Bg.Tabs:GetChildren()) do
+		if Button:IsA("GuiObject") == false then continue end
+		if Button.Name == SelectedCategory then
+			Button.Selected.Visible = true
+			Button.TextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+			Button.Icon.Image = "rbxassetid://".. Button.Icon:GetAttribute("SelectedIcon")
+		else
+			Button.Selected.Visible = false
+			Button.TextLabel.TextColor3 = Color3.fromRGB(100, 100, 100)
+			Button.Icon.Image = "rbxassetid://".. Button.Icon:GetAttribute("UnselectedIcon")
+		end
+	end
+	
+	if SelectedCategory == "Money" then
+		return
+	end
+	
+	local Items = {}
+	if SelectedCategory == "Decoration" then
+		for i,Data in pairs(HTTPS:JSONDecode(Player.Data[References[SelectedCategory]].Value)) do
+			local ItemName, ItemConfig = Util("GetConfig", References[SelectedCategory], Data[1])
+			table.insert(Items, {ItemName, Data[1], Data[2]})
+		end
+	else
+		for i,Id in pairs(HTTPS:JSONDecode(Player.Data[References[SelectedCategory]].Value)) do
+			local ItemName, ItemConfig = Util("GetConfig", References[SelectedCategory], Id)
+			
+			if SelectedCategory == "Gear" then
+				if ItemConfig.Food ~= true then
+					table.insert(Items, {ItemName, Id})
+				end
+				
+			elseif SelectedCategory == "Food" then
+				if ItemConfig.Food == true then
+					table.insert(Items, {ItemName, Id})
+				end
+				
+			else
+				table.insert(Items, {ItemName, Id})
+			end
+		end
+	end
+	
+	-- Sorting alphabetically & filtering keyword
+	local SortedItems = {}
+	for i,Data in pairs(Items) do
+		if Gui.Bg.Keyword.Input.Text ~= "" then
+			if string.match(string.lower(Data[1]), string.lower(Gui.Bg.Keyword.Input.Text)) == nil then
+				continue
+			end
+		end
+		
+		table.insert(SortedItems, {string.lower(string.sub(Data[1], 1, 1)), Data[2], Data[3]})
+	end
+	
+	table.sort(SortedItems, function(A, B)
+		return A[1] < B[1]
+	end)
+	
+	for i,Data in pairs(SortedItems) do
+		local Id, Amount = Data[2], Data[3]
+		
+		local ItemName, ItemConfig = Util("GetConfig", References[SelectedCategory], Id)
+		local Item = Gui.Bg.List:FindFirstChild(ItemConfig.Id)
+		if Item == nil then
+			table.insert(Debris, Item)
+			Item = Gui.Bg.List.UIGridLayout.Item:Clone()
+			Item.Name = ItemConfig.Id
+			Item.ItemName.Text = ItemName
+			
+
+			if Amount then
+				Item.AmountIcon.TextLabel.Text = Amount
+			else
+				Item.AmountIcon.Visible = false
+			end
+
+			if ItemConfig["27334614"] == true then
+				Item.VIP.Visible = true
+			end
+
+			if ItemConfig.BobuxItem == true then
+				local ProductConfig = Util("GetProductConfigFromItemId", References[SelectedCategory], ItemConfig.Id)
+				Item.Price.Text = ProductConfig.Price
+				Item.BobuxIcon.Visible = true
+			elseif ItemConfig.Price ~= nil then
+				Item.Price.Text = "$".. ItemConfig.Price
+			end
+			
+			Util("LoadViewport", Item.Viewport, nil, {
+				Type = References[SelectedCategory],
+				Identifier = Id,
+				Spin = true,
+				SpinSpeed = 0.01,
+				SpinWhileVisible = true,
+				ScrollingFrame = Gui.Bg.List,
+			})
+			
+			Util("LoadViewport", Item.Viewport, nil, {
+				Type = "Gears",
+				Identifier = 1,
+			})
+
+			GuiInteract(Item.Button, function()
+				if SelectedCategory == "Decoration" then
+					if Player.Stats.House.Value == Player.Stats.InsideHouse.Value then
+						local Status, Model = Util("FetchAsset", "Decorations", ItemConfig.Id)
+						
+						Player.Stats.Editing.Value = true
+
+						local Pos = Player.Character.HumanoidRootPart.Position + game:GetService("Workspace").CurrentCamera.CFrame.LookVector * 10
+						Pos = CFrame.new(Pos.X, Player.Stats.House.Value.Boundaries.Floor1.Position.Y + 0.5 + Model.PrimaryPart.Size.Y/2, Pos.Z)
+						if Util("GroundCheck", Pos.Position, Player.Stats.House.Value.EditingBoundaries:GetChildren()) == false then
+							Pos = Player.Character.HumanoidRootPart.Position - game:GetService("Workspace").CurrentCamera.CFrame.LookVector * 10
+							Pos = CFrame.new(Pos.X, Player.Stats.House.Value.Boundaries.Floor1.Position.Y + 0.5 + Model.PrimaryPart.Size.Y/2, Pos.Z)
+						end
+						Model:PivotTo(Pos)
+						local X, Y, Z = Util("GetDecoData", "Position", Player.Stats.House.Value, Model)
+						local AngleY = Util("GetDecoData", "Angle", Player.Stats.House.Value, Model)
+
+						Model:Destroy()
+						RepStorage.RemoteEvent:FireServer("DecorationInsert", Id, X, Y, Z, AngleY)
+						CloseGui()
+					else
+						RepStorage.ClientEvent:Fire("PopUp", 4, nil, {
+							Message = "You must be inside your house to place down furniture"
+						})
+					end
+
+				elseif SelectedCategory == "Food" then
+					if Item.Outline.Visible == false then
+						RepStorage.RemoteEvent:FireServer("GearEquip", Id)
+					else
+						RepStorage.RemoteEvent:FireServer("GearUnequip", Id)
+					end
+				else
+					if Item.Outline.Visible == false then
+						RepStorage.RemoteEvent:FireServer(SelectedCategory.. "Equip", Id)
+					else
+						RepStorage.RemoteEvent:FireServer(SelectedCategory.. "Unequip", Id)
+					end
+				end
+			end)
+		end
+		Item.LayoutOrder = i
+		if SelectedCategory ~= "Decoration" then
+			if Util("Equipped", Player, References[SelectedCategory], Id) == true then
+				Item.Outline.Visible = true
+			else
+				Item.Outline.Visible = false
+			end
+		end
+
+		Item:SetAttribute("Keep", true)
+		Item.Parent = Gui.Bg.List
+	end
+	
+	for i,GuiObj in pairs(Gui.Bg.List:GetChildren()) do
+		if GuiObj:IsA("GuiObject") == false then continue end
+		if GuiObj:GetAttribute("Keep") == true then
+			GuiObj:SetAttribute("Keep", nil)
+		else
+			GuiObj:Destroy()
+		end
+	end
+end
+
+
+for i,Frame in pairs(Gui.Bg.Tabs:GetChildren()) do
+	if Frame:IsA("GuiObject") == false then continue end
+
+	Frame.Button:SetAttribute("ClickStyle", "None")
+	GuiInteract(Frame.Button, function()
+		SelectedCategory = Frame.Name		
+		LoadItems()
+	end)
+end
+
+
+
+-- Search bar
+Gui.Bg.Keyword.Input:GetPropertyChangedSignal("Text"):Connect(function()
+	LoadItems(true)
+end)
+
+
