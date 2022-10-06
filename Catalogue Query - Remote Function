@@ -1,0 +1,299 @@
+--[[
+	Written by hunxrepair
+	2021/11/08
+]]
+local RepStorage		= game:GetService("ReplicatedStorage")
+local Util				= require(RepStorage:WaitForChild("Scripts"):WaitForChild("Utilities"))
+local Config			= require(Util("WFC", {RepStorage, "Scripts", "Configurations"}))
+
+
+local function LoadURL(URL, CategoryData)
+	local CacheRequest = Util("NewObj", "Folder", {
+		Name = URL,
+	})
+	game.Debris:AddItem(CacheRequest, 1800)
+	Util("NewObj", "StringValue", {
+		Name = "URL",
+		Value = URL,
+		Parent = CacheRequest
+	})
+	Util("NewObj", "StringValue", {
+		Name = "Category",
+		Value = CategoryData[1],
+		Parent = CacheRequest
+	})
+	Util("NewObj", "BoolValue", {
+		Name = "Loaded",
+		Parent = CacheRequest
+	})
+	CacheRequest.Parent = RepStorage.CatalogCacheRequests
+	
+	
+	local Cache = Util("NewObj", "Folder", {
+		Name = URL,
+	})
+	game.Debris:AddItem(Cache, 1800) -- Can't see how, but just in case
+	Util("NewObj", "StringValue", {
+		Name = "URL",
+		Value = URL,
+		Parent = Cache
+	})
+	Util("NewObj", "StringValue", {
+		Name = "Category",
+		Value = CategoryData[1],
+		Parent = Cache
+	})
+	Util("NewObj", "StringValue", {
+		Name = "CacheData",
+		Value = "[]",
+		Parent = Cache
+	})
+	Util("NewObj", "IntValue", {
+		Name = "Expiry",
+		Value = os.time() + 10,
+		Parent = Cache
+	})
+	--Util("NewObj", "ObjectValue", {
+	--	Name = "RequestReference",
+	--	Value = CacheRequest,
+	--	Parent = Cache
+	--})
+	
+	task.delay(Cache.Expiry.Value - os.time() + 1, function()
+		if Cache.Parent and os.time() >= Cache.Expiry.Value then
+			Cache:Destroy()
+		end
+	end)
+
+	local Response
+	local function RequestURL()
+		Response = game:GetService("HttpService"):GetAsync(URL)
+	end
+	
+	local S, E
+	for w = 1, 3 do
+		S, E = pcall(RequestURL)
+		-- If it was due to a web error try loading again
+		if S == false then
+			if string.match(E, "HTTP 500") == nil and string.match(E, "HttpError: Timedout") == nil then
+				break
+			end
+		else
+			break
+		end
+		task.wait(3)
+	end
+	
+	if S == false then
+		if string.match(E, "HTTP 500") or string.match(E, "HTTP 502") or string.match(E, "HTTP 520") then
+			Util("LogError", E, debug.traceback(), script)
+		else
+			Util("LogError", E .. "\n\n".. URL, debug.traceback(), script)
+		end
+		return false, "Failed to load items... 😡\n\n".. E
+	else
+		Response = game:GetService("HttpService"):JSONDecode(Response)
+
+		-- Keyword was filtered
+		if Response.data == nil then
+			return false, "Keyword was filtered... 🤬"
+		elseif #Response.data == 0 then
+			return false, "No items found 🤔"
+		end
+
+		local NewResponse = {data = {}, nextPageCursor = nil}
+		local LoadingBundles = 0
+		for i,ItemData in pairs(Response.data) do
+			task.spawn(function()
+				if ItemData.name == "[ Content Deleted ]" --[[and ItemData.description == "[ Content Deleted ]"]] then return end -- Users can still change the description after it's been moderated
+				if ItemData.assetType == 19 then return end -- Gears are restricted
+				-- Complications because for the "body parts", "emotes - x" category individual items
+				-- are displayed instead of the whole bundle
+				if CategoryData[2] == 17 or (CategoryData[2] == 12 and CategoryData[3] == 38) then
+					LoadingBundles += 1
+
+					local FindTerm, FormattedTerm
+					if ItemData.bundleType == 1 then
+						FindTerm = CategoryData[1]
+						FormattedTerm = string.gsub(FindTerm, "%s+", "")
+
+					elseif ItemData.bundleType == 2 then
+						FindTerm = string.sub(CategoryData[1], string.find(CategoryData[1], "-")+2)
+						FormattedTerm = FindTerm .. "Animation"
+					end
+
+					local Index = nil
+					for i,AssetType in pairs(Config("AssetTypeIndexes")) do
+						if AssetType == FormattedTerm then
+							Index = i
+							break
+						end
+					end
+
+					local BundleItems = Util("GetBundleItems", ItemData.id)
+					if BundleItems then
+						for i,BundleItemData in pairs(BundleItems) do
+							if string.find(BundleItemData[2], FindTerm) then
+								table.insert(NewResponse.data, {BundleItemData[1], "Asset", BundleItemData[2], Index, ItemData.id})
+								break
+							end
+						end
+
+						-- TODO This might not be needed if bundle fetcher can update update the bundles immediately
+					else
+						print("Didn't find new bundle data")
+						local BundleDetails = nil
+						local S, E = pcall(function()
+							BundleDetails = game:GetService("AssetService"):GetBundleDetailsAsync(ItemData.id)
+						end)
+
+						if S == false then
+							Util("LogError", E, debug.traceback(), script)
+							LoadingBundles -= 1
+							return
+						end
+
+						for i,BundleItem in pairs(BundleDetails.Items) do
+							if string.find(BundleItem.Name, FindTerm) then
+								table.insert(NewResponse.data, {BundleItem.Id, BundleItem.Type, BundleItem.Name, Index, ItemData.id})
+								break
+							end
+						end
+					end
+
+					LoadingBundles -= 1
+				else
+					table.insert(NewResponse.data, {ItemData.id, ItemData.itemType, ItemData.name, ItemData.assetType})
+				end
+			end)
+		end
+		NewResponse.nextPageCursor = Response.nextPageCursor
+
+		for w = 1, 100 do
+			task.wait(0.1)
+			if LoadingBundles == 0 then break end
+		end
+
+		Cache.CacheData.Value = game:GetService("HttpService"):JSONEncode(NewResponse)
+		Cache.Parent = RepStorage.CatalogCache
+		CacheRequest:Destroy()
+		
+		return true, Cache
+	end
+end
+
+local function ReturnFunction(User, Keyword, Category, Sort, SortAggregation, Cursor)
+	local Status, URL = Util("CreateQueryURL", Keyword, Category, Sort, SortAggregation, Cursor)
+	if Status == false then
+		return Status, URL
+	end
+	
+	local CategoryData = nil
+	for i,Data in pairs(Config("CatalogDropDowns").CategoryList) do
+		if Data[1] == Category then
+			CategoryData = Data
+			break
+		end
+	end
+	--print(URL)
+	
+	local Cache = nil
+	for i,CacheFolder in pairs(RepStorage.CatalogCache:GetChildren()) do
+		if CacheFolder.URL.Value == URL then
+			if CategoryData[2] == 12 or CategoryData[2] == 17 then
+				if CacheFolder.Category.Value ~= CategoryData[1] then
+					continue
+				end
+			end
+			
+			Cache = CacheFolder
+			break
+		end
+	end
+	if Cache then
+		Cache:WaitForChild("Expiry")
+		Cache.Expiry.Value = math.min(Cache.Expiry.Value + 45, os.time() + 300)
+		
+		task.delay(Cache.Expiry.Value - os.time() + 1, function()
+			if Cache:IsDescendantOf(game) == false then return end
+			if os.time() >= Cache.Expiry.Value then
+				Cache:Destroy()
+			end
+		end)
+	else
+		-- Check if URL has been requested already and is now loading
+		for i,CacheRequest in pairs(RepStorage.CatalogCacheRequests:GetChildren()) do
+			if CacheRequest.URL.Value == URL then
+				if CategoryData[2] == 12 or CategoryData[2] == 17 then
+					if CacheRequest.Category.Value ~= CategoryData[1] then
+						continue
+					end
+				end
+				
+				local End = os.clock() + 3
+				while true do
+					if os.clock() > End then break end
+					if Cache then break end
+					
+					task.wait(0.1)
+					for i,CacheFolder in pairs(RepStorage.CatalogCache:GetChildren()) do
+						if CacheFolder.URL.Value == URL then
+							if CategoryData[2] == 12 or CategoryData[2] == 17 then
+								if CacheFolder.Category.Value ~= CategoryData[1] then
+									continue
+								end
+							end
+							
+							Cache = CacheFolder
+							break
+						end
+					end
+				end
+				
+				break
+			end
+		end
+		
+		if Cache == nil then
+			local S, E = LoadURL(URL, CategoryData)
+			if S == false then
+				return S, E
+			else
+				Cache = E
+			end
+		end
+	end
+	
+	-- Caching the next page automatically, delay is necessary
+	task.delay(0, function()
+		local S, E = pcall(function()
+			if Cache:IsDescendantOf(game) == false then return end
+			
+			local Response = game:GetService("HttpService"):JSONDecode(Cache.CacheData.Value)
+			if Response.nextPageCursor then
+				local NewURL = Cache.URL.Value
+				local S, E = string.find(NewURL, "&cursor=")
+				if S == nil then
+					NewURL = NewURL .. "&cursor=".. Response.nextPageCursor
+				else
+					NewURL = string.sub(NewURL, 1, S - 1)
+					NewURL = NewURL .. "&cursor=".. Response.nextPageCursor
+				end
+				
+				LoadURL(NewURL, CategoryData)
+			end
+		end)
+		
+		if S == false then
+			Util("LogError", E, debug.traceback(), script)
+		end
+	end)
+	
+	return true, Cache.CacheData.Value
+end
+
+
+return ReturnFunction
+
+
+
