@@ -1,0 +1,222 @@
+local Player			= game.Players.LocalPlayer
+local RepStorage		= game:GetService("ReplicatedStorage")
+local Util				= require(RepStorage.Scripts.Utilities)
+local Config			= require(RepStorage.Scripts.Configurations)
+local GuiEffects		= require(RepStorage.Scripts.GuiEffects)
+local GS				= game:GetService("GuiService")
+local Knit				= require(RepStorage.KnitFolder.Knit)
+local Net				= require(Knit.Util.Net)
+local Trove				= require(Knit.Util.Trove)
+local Timer				= require(Knit.Util.Timer)
+local MainUI			= script.Parent.Parent
+local Gui				= MainUI:FindFirstChild(script.Name:sub(1, -11), true)
+
+
+local Controller = Knit.CreateController{
+	Name = script.Name,
+}
+
+
+function Controller.KnitStart()
+	local FeedbackButton = MainUI.Topbar.FeedbackButton
+	FeedbackButton.MouseEnter:Connect(function()
+		FeedbackButton.IconOverlay.BackgroundTransparency = 0.9
+	end)
+	FeedbackButton.MouseLeave:Connect(function()
+		FeedbackButton.IconOverlay.BackgroundTransparency = 1
+	end)
+	
+	FeedbackButton.IconButton.MouseButton1Click:Connect(function()
+		if Controller.GuiState == "Closed" then
+			Controller:Open()
+		elseif Controller.GuiState == "Open" then
+			Controller:Close()
+		end
+	end)
+	
+	-- Exit Menu
+	Gui.TopBar.Close.MouseButton1Click:Connect(function()
+		Controller:Close()
+	end)
+	
+	local function UpdatePosition()
+		if game:GetService("GuiService").TopbarInset.Height == 36 then
+			FeedbackButton.AnchorPoint = Vector2.new(0, 0)
+			FeedbackButton.Position = UDim2.fromOffset(104, 4)
+		else
+			FeedbackButton.AnchorPoint = Vector2.new(1, 0)
+			FeedbackButton.Position = UDim2.new(1, -4, 0, 4)
+		end
+	end
+	game:GetService("GuiService"):GetPropertyChangedSignal("TopbarInset"):Connect(UpdatePosition)
+	UpdatePosition()
+end
+
+
+function Controller.KnitInit()
+	Controller.GuiState = "Closed"
+end
+
+
+function Controller:Open(...)
+	if Controller.GuiState == "Open" then return end
+	Controller.GuiState = "Open"
+	if Controller.Trove then Controller.Trove:Clean() end
+	Controller.Trove = Trove.new()
+	
+	Controller.Trove:Connect(game:GetService("UserInputService").InputBegan, function(Input, GP)
+		if GP == true then return end
+		if Input.KeyCode ~= Enum.KeyCode.ButtonB then return end
+		Controller:Close()
+	end)
+	
+	Controller.Trove:Add(function()
+		for i,Button in pairs(Gui.List.OutlookIcons:GetChildren()) do
+			if Button:IsA("GuiObject") == false then continue end
+			Button.ImageColor3 = Color3.fromRGB(192, 192, 192)
+			Button:SetAttribute("Selected", nil)
+		end
+
+		Gui.List.Visible = true
+		Gui.ResponseText.Visible = false
+		Gui.List.Feedback.TextBox.Text = ""
+		Gui.List.Bugs.TextBox.Text = ""
+	end)
+	
+	local LastFeedback = os.time() - (Player:GetAttribute("LastFeedback") or 0)
+	if LastFeedback < 300 then
+		Controller:SpamBlock()
+	else
+		Controller:SetUp()
+	end
+	
+	Controller.Trove:AddPromise(GuiEffects("MenuOpen", Gui, Controller.Trove):andThen(function()
+		if Player:GetAttribute("GamepadEnabled") == true then
+			GS:AddSelectionParent(Gui.Name, Gui)
+			GS:Select(Gui)
+		end	
+	end))
+end
+
+
+function Controller:Close()
+	if Controller.GuiState == "Closed" then return end
+	Controller.GuiState = "Closed"
+	Controller.Trove:Clean()
+	Controller.Trove = nil
+	
+	if Player:GetAttribute("GamepadEnabled") == true then
+		GS:RemoveSelectionGroup(Gui.Name)
+		GS.SelectedObject = nil
+	end
+end
+
+
+function Controller:SpamBlock()
+	local DisplayName = string.upper(string.sub(Player.DisplayName, 1, 1)) .. string.sub(Player.Name, 2)
+	local Interval = Timer.new(0.5)
+	Controller.Trove:Add(Interval)
+	Interval.Tick:Connect(function()
+		local LastFeedback = 300 - (os.time() - (Player:GetAttribute("LastFeedback") or 0))
+		if LastFeedback <= 0 then
+			Interval:Destroy()
+			Controller:SetUp()
+		end
+		local TimeLeft = (DateTime.fromUnixTimestamp(LastFeedback)):FormatUniversalTime("mm:ss", "en-us")
+		Gui.ResponseText.Text = "Dear ".. DisplayName .. ",\nto counter spammers we allow one report to be sent every 5 minutes. You can send another message in ".. TimeLeft
+	end)
+	Interval:StartNow()
+	
+	Gui.List.Visible = false
+	Gui.ResponseText.Visible = true
+end
+
+
+function Controller:SetUp()
+	Gui.List.Visible = true
+	Gui.ResponseText.Visible = false
+	
+	for i,Button in pairs(Gui.List.OutlookIcons:GetChildren()) do
+		if Button:IsA("GuiObject") == false then continue end
+		Controller.Trove:Connect(Button.MouseButton1Click, function()
+			for i,Button in pairs(Gui.List.OutlookIcons:GetChildren()) do
+				if Button:IsA("GuiObject") == false then continue end
+				Button.ImageColor3 = Color3.fromRGB(192, 192, 192)
+				Button:SetAttribute("Selected", nil)
+			end
+			Button.ImageColor3 = Button:GetAttribute("SelectedColour")
+			Button:SetAttribute("Selected", true)
+		end)
+	end
+
+
+	Controller.Trove:Connect(Gui.List.Feedback.TextBox:GetPropertyChangedSignal("Text"), function()
+		if string.len(Gui.List.Feedback.TextBox.Text) > 500 then
+			local AlertController = Knit.GetController("AlertController")
+			AlertController:New("A maximum of 500 characters are allowed!", 5)
+			Gui.List.Feedback.TextBox.Text = string.sub(Gui.List.Feedback.TextBox.Text, 1, 500)
+		end
+	end)
+
+
+	Controller.Trove:Connect(Gui.List.Bugs.TextBox:GetPropertyChangedSignal("Text"), function()
+		if string.len(Gui.List.Bugs.TextBox.Text) > 500 then
+			local AlertController = Knit.GetController("AlertController")
+			AlertController:New("A maximum of 500 characters are allowed!", 5)
+			Gui.List.Bugs.TextBox.Text = string.sub(Gui.List.Bugs.TextBox.Text, 1, 500)
+		end
+	end)
+
+
+	Controller.Trove:Connect(Gui.List.Submit.MouseButton1Click, function()
+		local OutlookNum = nil
+		for i,Button in pairs(Gui.List.OutlookIcons:GetChildren()) do
+			if Button:GetAttribute("Selected") == true then
+				OutlookNum = tonumber(Button.Name)
+				break
+			end
+		end
+
+		if OutlookNum == nil then
+			local AlertController = Knit.GetController("AlertController")
+			AlertController:New("Please select one of the faces!", 5)
+			return
+		end
+
+
+		if string.len(Gui.List.Bugs.TextBox.Text) < 15 and string.len(Gui.List.Feedback.TextBox.Text) < 15 then
+			local AlertController = Knit.GetController("AlertController")
+			AlertController:New("Please write more! A minimum of 15 characters are necessary.", 5)
+			return
+		end
+
+
+		local FeedbackService = Knit.GetService("FeedbackService")
+		Controller.Trove:AddPromise(FeedbackService:Send(OutlookNum, Gui.List.Feedback.TextBox.Text, Gui.List.Bugs.TextBox.Text):andThen(function(Status)
+			if Status == true then
+				local Promise = require(Knit.Util.Promise)
+				Promise.new(function(Resolve, Reject)
+					local PolicyService = game:GetService("PolicyService")
+					local PolicyInfo = PolicyService:GetPolicyInfoForPlayerAsync(Player)
+					
+					if table.find(PolicyInfo.AllowedExternalLinkReferences, "Discord") then
+						Gui.ResponseText.Text = "Thanks for your message! Join our Discord server 🐋 so we can fix bugs faster and discuss your ideas with the community. \n\n❤"
+						Resolve()
+					end
+					Reject()
+				end):catch(function()
+					Gui.ResponseText.Text = "Thanks for your message! We read and consider all messages sent to us. By sending us feedback you are making the game better.\n\n❤"
+				end):finally(function()
+					Gui.List.Visible = false
+					Gui.ResponseText.Visible = true
+				end)
+			else
+				local AlertController = Knit.GetController("AlertController")
+				AlertController:New("ROBLOX has filtered your message! Please reword it.", 5)
+			end
+		end))
+	end)
+end
+
+
+return Controller
