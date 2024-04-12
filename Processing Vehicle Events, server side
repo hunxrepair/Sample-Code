@@ -1,0 +1,219 @@
+local RepStorage		= game:GetService("ReplicatedStorage")
+local SerStorage		= game:GetService("ServerStorage")
+local Util				= require(RepStorage.Scripts.Utilities)
+local Config			= require(RepStorage.Scripts.Configurations)
+local Knit				= require(RepStorage.KnitFolder.Knit)
+local Net				= require(Knit.Util.Net)
+local GA				= require(RepStorage.Scripts.GameAnalytics)
+
+
+
+local Service = Knit.CreateService{
+	Name = script.Name,
+}
+
+
+function Service.KnitStart()
+end
+
+function Service.KnitInit()
+end
+
+
+
+
+function Service.Client:Buy(User, Id)
+	local VehicleConfig = Util("GetConfig", "Vehicles", Id)
+	if VehicleConfig == nil then return end
+	if VehicleConfig.GamepassConfig ~= nil or VehicleConfig.DevProductConfig ~= nil then return end
+	
+	local UserData = require(game.ServerStorage.Components.UserData):FromInstance(User)
+	if UserData == nil then return false end
+	
+	if Util("Owned", User, "Vehicles", VehicleConfig.Id) == true then
+		return false
+	end
+	
+	if VehicleConfig.RebirthId ~= nil then
+		if Util("Owned", User, "Rebirths", VehicleConfig.RebirthId) == false then
+			Net:RemoteEvent("Alert"):FireClient(User, "Unlocked after REBIRTH #".. VehicleConfig.RebirthId)
+			return false
+		end
+	end
+	
+	if VehicleConfig.GroupCar == true then
+		local IsInGroup = false
+		for i,GroupData in pairs(game:GetService("GroupService"):GetGroupsAsync(User.UserId)) do
+			if GroupData.Id == Config("Universe").GroupId then
+				IsInGroup = true
+				break
+			end
+		end
+		if IsInGroup == false then
+			Net:RemoteEvent("Alert"):FireClient(User, "Join Fat Whale Games to buy this car!", 2)
+			return false
+		end
+	end
+
+	if Util("Owned", User, "Cash", VehicleConfig.Price) == false then
+		Net:RemoteEvent("Alert"):FireClient(User, "You don't have enough cash", 2)
+		return false
+	end
+
+	local Status = UserData:AddVehicle(VehicleConfig.Id)
+	if Status == true then
+		UserData:CashIncrement(-VehicleConfig.Price)
+		Net:RemoteEvent("Alert"):FireClient(User, "Purchased!", 2)
+
+		GA:addDesignEvent(User.UserId, {
+			eventId = "Vehicle:Purchase:".. VehicleConfig.Name,
+			value = 1;
+		})
+
+		GA:addResourceEvent(User.UserId, {
+			flowType = GA.EGAResourceFlowType.Sink,
+			currency = "Cash",
+			amount = VehicleConfig.Price,
+			itemType = "VehiclePurchase",
+			itemId = VehicleConfig.Name,
+		})
+
+		return true
+	else
+		Net:RemoteEvent("Alert"):FireClient(User, "Something went wrong", 2)
+		return false
+	end
+end
+
+function Service.Client:EquipUpgrade(User,Id,UpgradeTypeId,UpgradeId)
+	local UserData = require(game.ServerStorage.Components.UserData):FromInstance(User)
+	if UserData == nil then return false end
+
+	if Util("Owned", User, "VehicleUpgrades", Id, UpgradeTypeId, UpgradeId) == true or UpgradeId == 0 then
+		local Status = UserData:EquipVehicleUpgrade(Id, UpgradeTypeId, UpgradeId)
+		if Status == true then
+			return true
+		else
+			Net:RemoteEvent("Alert"):FireClient(User, "Something went wrong", 2)
+			return false
+		end
+	end
+end
+
+function Service.Client:BuyUpgrade(User, Id, UpgradeTypeId, UpgradeId)
+
+	local VehicleConfig = Util("GetConfig", "Vehicles", Id)
+	local UpgradeConfig = require(game:GetService("ReplicatedStorage"):WaitForChild("Scripts"):WaitForChild("Configurations"):WaitForChild("VehicleUpgrades"))[UpgradeTypeId]
+
+	if VehicleConfig == nil then return end
+	--if VehicleConfig.GamepassConfig ~= nil or VehicleConfig.DevProductConfig ~= nil then return end
+
+	local UserData = require(game.ServerStorage.Components.UserData):FromInstance(User)
+	if UserData == nil then return false end
+
+	if Util("Owned", User, "Vehicles", VehicleConfig.Id) ~= true then return false end
+
+	if Util("Owned", User, "VehicleUpgrades", VehicleConfig.Id, UpgradeTypeId, UpgradeId) == true then
+		return false
+	end
+
+	local Price = 0
+	local UpgradeNames = {
+		"Engine",
+		"Health",
+		"BodyColor",
+		"RimColor",
+		"BodyColor2",
+	}
+
+	if UpgradeTypeId == 1 or UpgradeTypeId == 2 then
+
+		local PercentPrice = false
+
+		for _,Data in pairs(UpgradeConfig) do
+			if Data.Id == UpgradeId then
+				PercentPrice = Data.PricePercentage
+				break
+			end
+		end
+
+		if not PercentPrice then return false end
+		Price = math.round((2500*UpgradeId) + (VehicleConfig.Price*(PercentPrice*0.01)))
+	elseif UpgradeTypeId > 2 then
+		Price = UpgradeConfig.ColorPrice
+	end
+
+	if Util("Owned", User, "Cash", Price) == false then
+		Net:RemoteEvent("Alert"):FireClient(User, "You don't have enough cash", 2)
+		return false
+	end
+
+	local Status = UserData:AddVehicleUpgrade(VehicleConfig.Id, UpgradeTypeId, UpgradeId)
+	if Status == true then
+		UserData:CashIncrement(-Price)
+		Net:RemoteEvent("Alert"):FireClient(User, "Purchased!", 2)
+
+
+		GA:addDesignEvent(User.UserId, {
+			eventId = "Vehicle:UpgradePurchase:".. VehicleConfig.Name ..":"..UpgradeNames[UpgradeTypeId]..":"..UpgradeId,
+			value = 1;
+		})
+
+		GA:addResourceEvent(User.UserId, {
+			flowType = GA.EGAResourceFlowType.Sink,
+			currency = "Cash",
+			amount = VehicleConfig.Price,
+			itemType = "VehicleUpgradePurchase",
+			itemId = VehicleConfig.Name,
+		})
+
+		Service.Client:EquipUpgrade(User,Id,UpgradeTypeId,UpgradeId)
+
+		return true
+	else
+		Net:RemoteEvent("Alert"):FireClient(User, "Something went wrong", 2)
+		return false
+	end
+end
+
+function Service.Client:Spawn(User, Id, GarageOwnerId)
+	if GarageOwnerId ~= User.UserId then
+		if Knit.GetService("CrewService"):InSameCrew(GarageOwnerId, User.UserId) == false then
+			return
+		end
+	end
+	local VehicleConfig = Util("GetConfig", "Vehicles", Id)
+	if VehicleConfig == nil then return end
+
+	if Util("Owned", User, "Vehicles", VehicleConfig.Id) == false then
+		return false
+	end
+
+
+	local Vehicle = game.Workspace.Vehicles:FindFirstChild(User.UserId)
+	if Vehicle then Vehicle:Destroy() end
+
+	local Vehicle = RepStorage.Vehicles[VehicleConfig.Name]:Clone()
+
+	local VehicleConfig2 = Util("GetUpgradedVehicleStats",User,Id)
+
+	Vehicle:SetAttribute("MaxSteer",VehicleConfig2.MaxSteer)
+	Vehicle:SetAttribute("MaxSpeed",VehicleConfig2.MaxSpeed)
+	Vehicle:SetAttribute("DrivingTorque",VehicleConfig2.DrivingTorque)
+	Vehicle:SetAttribute("BaseEngineRPM",VehicleConfig2.BaseEngineRPM)
+	Vehicle:SetAttribute("MaxEngineRPM",VehicleConfig2.MaxEngineRPM)
+	Vehicle:SetAttribute("Health",VehicleConfig2.Health)
+	Vehicle:SetAttribute("MaxHealth",VehicleConfig2.Health)
+
+	Util("ColorVehicle",User,Id,Vehicle.Body)
+
+	Vehicle.Name = User.UserId
+
+
+	Util("SpawnVehicle", "Garage", Vehicle, User, GarageOwnerId)
+
+	return true
+end
+
+
+return Service
