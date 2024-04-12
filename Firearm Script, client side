@@ -1,0 +1,1448 @@
+local Player			= game.Players.LocalPlayer
+local RepStorage		= game.ReplicatedStorage
+local Util				= require(RepStorage.Scripts.Utilities)
+local Config			= require(RepStorage.Scripts.Configurations)
+local Knit				= require(RepStorage.KnitFolder.Knit)
+local Component			= require(Knit.Util.Component)
+local Net				= require(Knit.Util.Net)
+local Trove				= require(Knit.Util.Trove)
+local Timer				= require(Knit.Util.Timer)
+local Promise			= require(Knit.Util.Promise)
+local FirearmService	= Knit.GetService("FirearmService")
+local Camera			= game.Workspace.CurrentCamera
+local Mouse				= Player:GetMouse()
+local UIS				= game:GetService("UserInputService")
+
+
+local ZoomOnEquip = {13, 9} -- PC,mobile
+local ZoomOnUnEquip = {13, 9}
+local ZoomOnAim = {10, 7}
+
+
+local Handler = Component.new({
+	Tag = "Firearm",
+})
+
+
+function Handler:Construct()
+	self.Trove = Trove.new()
+	
+	local function GetShooter()
+		local Shooter = self.Instance.Parent.Parent
+		if Shooter.ClassName ~= "Player" then
+			Shooter = game.Players:GetPlayerFromCharacter(self.Instance.Parent)
+		end
+		if Shooter == nil then
+			warn("Couldn't fetch Shooter for ".. self.Instance:GetFullName())
+		end
+		return Shooter
+	end
+	self.Shooter = GetShooter()
+	
+	
+	self.Anims = {}
+	self.FirearmConfig = Util("GetConfig", "Firearms", self.Instance.Name)
+	
+	if self.Shooter == Player then
+		self.Instance.Equipped:Connect(function()
+			if self.Shooter.Character == nil then return end
+			if self.Shooter.Character:FindFirstChild("Humanoid") == nil then return end
+			if self.Shooter.Character.Humanoid.Health <= 0 then return end
+			if self.Shooter.Character.Humanoid.SeatPart and self.Shooter.Character.Humanoid.SeatPart.Name ~= "SeatSWAT" then return end
+			self:Equipped()
+		end)
+		
+		self.Instance.Unequipped:Connect(function()
+			self:Unequipped()
+		end)
+	else
+		self.Instance.AncestryChanged:Connect(function(Child, Parent)
+			if Parent == nil then return end
+			if Parent == self.Shooter.Character then
+				self:Equipped()
+			else
+				self:Unequipped()
+			end
+		end)
+	end
+	
+	if self.Shooter ~= Player then return end
+	
+	self.Ammo = self.FirearmConfig.Ammo
+	self.Aiming = false
+	self.LastFire = 0
+	self.CurrentSpread = self.FirearmConfig.Spread[1]
+	self.Reloading = false
+	self.ThrowingGrenade = false
+	
+	self.OrigMouseDeltaSensitivity = UIS.MouseDeltaSensitivity
+end
+
+
+function Handler:Start()
+	require(RepStorage.Components.PlayerData):WaitForInstance(self.Shooter):andThen(function(OwnerData)
+		self.OwnerData = OwnerData
+	end)
+	if self.Shooter ~= Player then return end
+end
+
+function Handler:Stop()
+	self.Trove:Clean()
+	self.Trove = nil
+	
+	for i,AnimTrack in pairs(self.Anims) do
+		AnimTrack:Stop()
+	end
+	self.Anims = {}
+end
+
+
+function Handler:Equipped()	
+	self:OnEquipped()
+	self:DetectServerFiring()
+	if self.Shooter ~= Player then return end
+	self:CustomCamera()
+	self:CreateFakeArms()
+	self:UpdateAmmoBar()
+	self:DetectFiring()
+	self:DetectOnSeated()
+	self:AlterCrosshair()
+	self:DetectAIs()
+end
+
+
+function Handler:OnEquipped()
+	self.SubTrove = self.Trove:Extend()
+	self.ReloadTrove = self.SubTrove:Extend()
+	
+	self.DebrisFolder = Instance.new("Folder")
+	self.SubTrove:Add(self.DebrisFolder)
+	self.DebrisFolder.Parent = game.Workspace
+	
+	self.AudioFolder = Instance.new("Attachment")
+	self.SubTrove:Add(self.AudioFolder)
+	self.AudioFolder.Parent = self.Shooter.Character.Head
+	
+	Util("NewSound", "PlayAndDestroy", {
+		SoundId = self.FirearmConfig.EquipSoundId,
+		Volume = self.FirearmConfig.EquipSoundVolume,
+		Parent = self.AudioFolder,
+	})
+	if Player ~= self.Shooter then return end
+	
+	
+	-- Equipped Animation
+	local EquippedAnim = Instance.new("Animation")
+	EquippedAnim.AnimationId = self.FirearmConfig.EquippedAnimId
+	local EquippedTrack = self.Shooter.Character.Humanoid:LoadAnimation(EquippedAnim)
+	EquippedTrack:Play()
+	self.Anims["EquippedTrack"] = EquippedTrack
+
+	-- Knockback Animation
+	local KnockbackAnim = Instance.new("Animation")
+	KnockbackAnim.AnimationId = self.FirearmConfig.KnockbackAnimId
+	local KnockbackTrack = self.Shooter.Character.Humanoid:LoadAnimation(KnockbackAnim)
+	self.Anims["KnockbackTrack"] = KnockbackTrack
+
+	-- Reloading Animation
+	local ReloadingAnim = Instance.new("Animation")
+	ReloadingAnim.AnimationId = self.FirearmConfig.ReloadingAnimId
+	local ReloadingTrack = self.Shooter.Character.Humanoid:LoadAnimation(ReloadingAnim)
+	self.Anims["ReloadingTrack"] = ReloadingTrack
+	
+	-- Grenade Throwing Animation
+	local GrenadeThrowAnim = Instance.new("Animation")
+	GrenadeThrowAnim.AnimationId = Config("Universe").GrenadeThrowAnimId
+	local GrenadeThrowTrack = self.Shooter.Character.Humanoid:LoadAnimation(GrenadeThrowAnim)
+	self.Anims["GrenadeThrowTrack"] = GrenadeThrowTrack
+	
+	-- Preload Assets
+	local Assets = {
+		Util("NewObj", "Decal", {Texture = RepStorage.UIs.FirearmGui.Scope.ScopeImage.Image, Parent = self.DebrisFolder}),
+		Util("NewObj", "Sound", {SoundId = self.FirearmConfig.FireSoundId, Parent = self.DebrisFolder}),
+		Util("NewObj", "Sound", {SoundId = Config("Universe").GrenadeUnpinSoundId, Parent = self.DebrisFolder}),
+		Util("NewObj", "Sound", {SoundId = Config("Universe").GrenadeThrowSoundId, Parent = self.DebrisFolder}),
+	}
+	task.defer(function()
+		game:GetService("ContentProvider"):PreloadAsync(Assets)
+	end)
+	
+	self.FirearmGui = RepStorage.UIs.FirearmGui:Clone()
+	self.SubTrove:Add(self.FirearmGui)
+	UIS.MouseIconEnabled = false
+	
+	if Player:GetAttribute("TouchEnabled") == true then
+		if Player:GetAttribute("Platform") == "Phone" then
+			self.FirearmGui.PhoneButtons.Name = "Touchscreen"
+		else
+			self.FirearmGui.TabletButtons.Name = "Touchscreen"
+		end
+		
+		self.FirearmGui.Touchscreen.Visible = true
+		Player.PlayerGui.TouchGui.TouchControlFrame.JumpButton:SetAttribute("OrigPos", Player.PlayerGui.TouchGui.TouchControlFrame.JumpButton.Position)
+		Player.PlayerGui.TouchGui.TouchControlFrame.JumpButton.Position += UDim2.fromScale(1, 0)
+		
+		self.FirearmGui.Touchscreen.AimButton.MouseButton1Click:Connect(function()
+			self:Aim(not self.Aiming)
+		end)
+		self.FirearmGui.Touchscreen.ReloadButton.MouseButton1Click:Connect(function()
+			self:Reload()
+		end)
+		self.FirearmGui.Touchscreen.GrenadeButton.MouseButton1Click:Connect(function()
+			self:ThrowGrenadeStart()
+		end)
+		
+		self.FirearmGui.Touchscreen.JumpButton.InputBegan:Connect(function(Input)
+			if Input.UserInputType == Enum.UserInputType.Touch then
+				self:Jump(Input)
+			end
+		end)
+	else
+		self.FirearmGui.PhoneButtons.Visible = false
+		self.FirearmGui.TabletButtons.Visible = false
+	end
+	
+	-- Controls UI
+	local function NewControlItem(Action, Control)
+		local Item = self.FirearmGui.Controls.UIListLayout.Item:Clone()
+		Item.Text = "<b>".. Action ..":</b> ".. Control
+		Item.Parent = self.FirearmGui.Controls
+	end
+	
+	if Player:GetAttribute("ControlsShown") ~= true or self.FirearmConfig.Id == 10 then
+		if Player:GetAttribute("GamepadEnabled") == true then
+			NewControlItem("Fire", "RT")
+			NewControlItem("Aim", "LT")
+			NewControlItem("Sprint", "Up Button")
+			NewControlItem("Reload", "Y")
+			NewControlItem("Crouch", "Down Button")
+			NewControlItem("Grenade", "X")
+		elseif Player:GetAttribute("TouchEnabled") ~= true then
+			NewControlItem("Fire", "Left Mouse Button")
+			NewControlItem("Aim", "Q/Right Mouse Button")
+			NewControlItem("Sprint", "Left Shift")
+			NewControlItem("Reload", "R")
+			NewControlItem("Crouch", "C")
+			NewControlItem("Grenade", "G")
+		end
+		
+		if Player:GetAttribute("GamepadEnabled") == true or Player:GetAttribute("TouchEnabled") ~= true then
+			Player:SetAttribute("ControlsShown", true)
+			game.Debris:AddItem(self.FirearmGui.Controls, 15)
+		end
+	end
+	
+	local Crosshair = self.FirearmGui["Crosshair".. Player:GetAttribute("Platform")]
+	Crosshair.Visible = true
+	Crosshair.Name = "Crosshair"
+	if self.FirearmGui:FindFirstChild("CrosshairDesktop") then self.FirearmGui.CrosshairDesktop:Destroy() end
+	if self.FirearmGui:FindFirstChild("CrosshairConsole") then self.FirearmGui.CrosshairConsole:Destroy() end
+	if self.FirearmGui:FindFirstChild("CrosshairTablet") then self.FirearmGui.CrosshairTablet:Destroy() end
+	if self.FirearmGui:FindFirstChild("CrosshairPhone") then self.FirearmGui.CrosshairPhone:Destroy() end
+	
+	-- Grenade Count
+	local function UpdateGrenadeUI()
+		if Player.Character:GetAttribute("Grenades") == nil then
+			self.FirearmGui.GrenadeCount.Visible = false
+			if Player:GetAttribute("TouchEnabled") == true then
+				self.FirearmGui.Touchscreen.GrenadeButton.Visible = false
+			end
+			return
+		end
+		self.FirearmGui.GrenadeCount.Visible = true
+		self.FirearmGui.GrenadeCount.TextLabel.Text = Player.Character:GetAttribute("Grenades") .. "/3"
+		if Player:GetAttribute("TouchEnabled") == true then
+			self.FirearmGui.Touchscreen.GrenadeButton.Visible = true
+		end
+	end
+	self.SubTrove:Connect(Player.Character:GetAttributeChangedSignal("Grenades"), UpdateGrenadeUI)
+	UpdateGrenadeUI()
+	
+	self.FirearmGui.Parent = Player.PlayerGui
+	
+	
+	-- Detecting Keys
+	self.SubTrove:Connect(UIS.InputBegan, function(Input, GP)
+		if GP == true then return end
+		
+		if Input.UserInputType == Enum.UserInputType.MouseButton2 then
+			self:Aim(true)
+		elseif Input.KeyCode == Enum.KeyCode.R or Input.KeyCode == Enum.KeyCode.ButtonY then
+			self:Reload()
+		elseif Input.KeyCode == Enum.KeyCode.Q or Input.KeyCode == Enum.KeyCode.ButtonL2 then
+			self:Aim(not self.Aiming)
+		elseif Input.KeyCode == Enum.KeyCode.G or Input.KeyCode == Enum.KeyCode.ButtonX then
+			self:ThrowGrenadeStart()
+		end
+	end)
+	self.SubTrove:Connect(UIS.InputEnded, function(Input, GP)
+		if GP == true then return end
+		if Input.UserInputType == Enum.UserInputType.MouseButton2 then
+			self:Aim(false)
+		end
+	end)
+	
+	-- When user switches guns and they are already aiming
+	if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) == true then
+		self.SubTrove:Add(task.defer(function()
+			self:Aim(true)
+		end))
+	end
+	
+	-- Decreasing Spread
+	self.SubTrove:Connect(game:GetService("RunService").Heartbeat, function(Step)
+		self.CurrentSpread = math.max(self.FirearmConfig.Spread[1], self.CurrentSpread - self.FirearmConfig.SpreadDecreasePerSecond * Step)
+	end)
+	
+	-- Combat no-clipping
+	local RaycastParamaters = RaycastParams.new()
+	RaycastParamaters.FilterType = Enum.RaycastFilterType.Exclude
+	RaycastParamaters.FilterDescendantsInstances = {Player.Character}
+	local RaycastResult = game.Workspace:Raycast(Player.Character.HumanoidRootPart.Position, Player.Character.HumanoidRootPart.CFrame.LookVector * 1.5, RaycastParamaters)
+	if RaycastResult ~= nil and RaycastResult.Instance ~= nil then
+		Player.Character.HumanoidRootPart.CFrame *= CFrame.new(0, 0, 0.75)
+	end
+	
+	-- Fix camera bug when entering/exiting car seat
+	self.SubTrove:Connect(Player.Character.Humanoid:GetPropertyChangedSignal("SeatPart"), function()
+		task.defer(function()
+			Player.PlayerScripts.PlayerModule.CameraModule.MouseLockController.MouseLock:Fire(false)
+			Player.PlayerScripts.PlayerModule.CameraModule.MouseLockController.MouseLock:Fire(true)
+		end)
+	end)
+	
+	-- Updating waist value
+	self.SubTrove:Add(Timer.Simple(0.25, function()
+		local Pitch, Yaw = Camera.CFrame:ToEulerAnglesYXZ()
+		local PitchData = string.pack("b", math.clamp(Pitch / 1.4 * 127, -127, 127))
+		local YawData
+		
+		if Player.Character.Humanoid.SeatPart ~= nil then
+			local Pitch2, Yaw2 = Player.Character.Humanoid.SeatPart.CFrame:ToEulerAnglesYXZ()
+			
+			Yaw = Yaw2-Yaw
+			
+			YawData = string.pack("b", math.clamp(Yaw / math.pi * 127, -127, 127))
+		end
+		Net:UnreliableRemoteEvent("UpdateWaist"):FireServer(self.Instance, PitchData, YawData)
+	end))
+	
+	
+	self.SubTrove:Connect(Net:RemoteEvent("BulletHit").OnClientEvent, function()
+		self:HitMarkerPop()
+	end)
+	
+	self.SubTrove:Connect(Net:RemoteEvent("DamageIndicator").OnClientEvent, function(...)
+		self:DamageIndicator(...)
+	end)
+	
+	self.SubTrove:Add(task.defer(function()
+		if self.Ammo == 0 then
+			self:Reload()
+		end
+	end))
+end
+
+function Handler:Unequipped()
+	self.SubTrove:Clean()
+	self.FirearmGui = nil
+	self.Reloading = false
+	self.ThrowingGrenade = false
+	for i,AnimTrack in pairs(self.Anims) do
+		AnimTrack:Stop()
+	end
+	self.Anims = {}
+	
+	if Player ~= self.Shooter then return end
+	
+	Util("NewSound", "PlayAndDestroy", {
+		SoundId = self.FirearmConfig.UnequipSoundId,
+		Volume = self.FirearmConfig.UnequipSoundVolume,
+		Parent = self.Shooter.Character.Head,
+	})
+	
+	-- If Player didn't switch guns
+	if Player.Character:FindFirstChildOfClass("Tool") == nil then
+		if Player:GetAttribute("Platform") == "Phone" or Player:GetAttribute("Platform") == "Tablet" then
+			Player.CameraMinZoomDistance = ZoomOnUnEquip[2]
+			Player.CameraMaxZoomDistance = ZoomOnUnEquip[2] + 1
+		else
+			Player.CameraMinZoomDistance = ZoomOnUnEquip[1]
+			Player.CameraMaxZoomDistance = ZoomOnUnEquip[1] + 1
+		end
+		task.defer(function()
+			Player.CameraMinZoomDistance = 0.5
+			Player.CameraMaxZoomDistance = 400
+		end)
+	end
+	
+	UIS.MouseIconEnabled = true
+	
+	self:Aim(false)
+	if Player:GetAttribute("TouchEnabled") == true then
+		Player.PlayerGui.TouchGui.TouchControlFrame.JumpButton.Position = Player.PlayerGui.TouchGui.TouchControlFrame.JumpButton:GetAttribute("OrigPos")
+	end
+	
+	Player.PlayerScripts.PlayerModule.CameraModule.MouseLockController.MouseLock:Fire(false)
+	UIS.MouseDeltaSensitivity = self.OrigMouseDeltaSensitivity
+	
+	if Player.Character then
+		if Player.Character:FindFirstChild("UpperTorso") and Player.Character.UpperTorso:FindFirstChild("Waist") then
+			Player.Character.UpperTorso.Waist.C1 = CFrame.new(Player.Character.UpperTorso.Waist.C1.Position)
+		end
+		if Player.Character:FindFirstChild("Humanoid") then
+			Util("Tween", Player.Character.Humanoid, 0.05, "Sine", "Out", {
+				CameraOffset = Vector3.new(0, 0, 0),
+			}):Play()
+		end
+	end
+	
+	Net:UnreliableRemoteEvent("UpdateWaist"):FireServer(self.Instance, "Reset")
+end
+
+
+function Handler:Aim(State)
+	if self.Aiming == State then return end
+	
+	if State == true then
+		if Player.Character.Humanoid.SeatPart ~= nil and Player.Character.Humanoid.SeatPart.Name ~= "SeatSWAT" then return end
+		if self.Reloading == true and self.FirearmConfig.Scoped == false then return end
+		self.Aiming = true
+		
+		if self.CameraMode == "ThirdPerson" then
+			if Player:GetAttribute("Platform") == "Phone" or Player:GetAttribute("Platform") == "Tablet" then
+				Player.CameraMinZoomDistance = ZoomOnAim[2]
+				Player.CameraMaxZoomDistance = ZoomOnAim[2] + 0.2
+			else
+				Player.CameraMinZoomDistance = ZoomOnAim[1]
+				Player.CameraMaxZoomDistance = ZoomOnAim[1] + 0.2
+			end
+			task.defer(function()
+				Player.CameraMinZoomDistance = 0.5
+				Player.CameraMaxZoomDistance = 400
+			end)
+		end
+		
+		if Player:GetAttribute("Platform") == "Desktop" or Player:GetAttribute("Platform") == "Console" then
+			UIS.MouseDeltaSensitivity = self.FirearmConfig.AimMouseSensitivity
+		else
+			UIS.MouseDeltaSensitivity = self.FirearmConfig.AimMouseSensitivity * 0.5
+		end
+		Util("Tween", Camera, 0.3, "Sine", "Out", {
+			FieldOfView = self.FirearmConfig.AimFOV,
+		}):Play()
+		
+		if self.FirearmConfig.Scoped == true then
+			Util("Tween", self.FirearmGui.Scope.ScopeImage, 0.3, "Sine", "Out", {
+				ImageTransparency = 0,
+			}):Play()
+			for i,Frame in pairs(self.FirearmGui.Scope.ScopeImage:GetChildren()) do
+				if Frame.ClassName ~= "Frame" then continue end
+				Util("Tween", Frame, 0.3, "Sine", "Out", {
+					BackgroundTransparency = 0,
+				}):Play()
+			end
+			self.FirearmGui.Crosshair.Visible = false
+		end
+		
+	elseif State == false then
+		if self.CameraMode == "ThirdPerson" then
+			if Player:GetAttribute("Platform") == "Phone" or Player:GetAttribute("Platform") == "Tablet" then
+				Player.CameraMinZoomDistance = ZoomOnEquip[2]
+				Player.CameraMaxZoomDistance = ZoomOnEquip[2] + 1
+			else
+				Player.CameraMinZoomDistance = ZoomOnEquip[1]
+				Player.CameraMaxZoomDistance = ZoomOnEquip[1] + 1
+			end
+			task.defer(function()
+				Player.CameraMinZoomDistance = 0.5
+				Player.CameraMaxZoomDistance = 400
+			end)
+		end
+		
+		UIS.MouseDeltaSensitivity = self.FirearmConfig.MouseSensitivity
+		Util("Tween", Camera, 0.1, "Sine", "Out", {
+			FieldOfView = 70,
+		}):Play()
+		if self.FirearmConfig.Scoped == true and self.FirearmGui ~= nil then
+			Util("Tween", self.FirearmGui.Scope.ScopeImage, 0.3, "Sine", "Out", {
+				ImageTransparency = 1,
+			}):Play()
+			for i,Frame in pairs(self.FirearmGui.Scope.ScopeImage:GetChildren()) do
+				if Frame.ClassName ~= "Frame" then continue end
+				Util("Tween", Frame, 0.3, "Sine", "Out", {
+					BackgroundTransparency = 1,
+				}):Play()
+			end
+			self.FirearmGui.Crosshair.Visible = true
+		end
+		
+		self.Aiming = false
+	end
+end
+
+
+function Handler:AlterCrosshair(State)
+	self.SubTrove:Connect(game:GetService("RunService").Heartbeat, function()
+		local SpreadPercent = (self.CurrentSpread - self.FirearmConfig.Spread[1]) / (self.FirearmConfig.Spread[2] - self.FirearmConfig.Spread[1])
+		local SpreadIncrease = 3.5 * SpreadPercent
+		local Base = self.Aiming == false and -0.15 or -0.2
+		
+		Util("Tween", self.FirearmGui.Crosshair.Top, 0.01, "Sine", "Out", {
+			Position = UDim2.new(0.5, 0, -Base - SpreadIncrease, 0),
+		}):Play()
+		Util("Tween", self.FirearmGui.Crosshair.Bottom, 0.01, "Sine", "Out", {
+			Position = UDim2.new(0.5, 0, 1 + Base + SpreadIncrease, 0),
+		}):Play()
+		Util("Tween", self.FirearmGui.Crosshair.Left, 0.01, "Sine", "Out", {
+			Position = UDim2.new(-Base - SpreadIncrease, 0, 0.5, 0),
+		}):Play()
+		Util("Tween", self.FirearmGui.Crosshair.Right, 0.01, "Sine", "Out", {
+			Position = UDim2.new(1 + Base + SpreadIncrease, 0, 0.5, 0),
+		}):Play()
+	end)
+end
+
+
+function Handler:HitMarkerPop()
+	if self.HitMarkerTask ~= nil then
+		task.cancel(self.HitMarkerTask)
+	end
+	
+	for i,Frame in pairs(self.FirearmGui.Crosshair:GetChildren()) do
+		if Frame.ClassName ~= "Frame" then continue end
+		Frame.BackgroundColor3 = Color3.new(1, 0, 0)
+		Frame.BorderColor3 = Color3.new(1, 0, 0)
+	end
+	
+	self.HitMarkerTask = self.SubTrove:Add(task.delay(0.6, function()
+		for i,Frame in pairs(self.FirearmGui.Crosshair:GetChildren()) do
+			if Frame.ClassName ~= "Frame" then continue end
+			Frame.BackgroundColor3 = Color3.new(1, 1, 1)
+			Frame.BorderColor3 = Color3.fromRGB(145, 145, 145)
+		end
+		self.HitMarkerTask = nil
+	end))
+	
+	if self.Aiming == true and self.IsScoped == true then
+		self.FirearmGui.Crosshair.Visible = true
+		self.SubTrove:Add(task.delay(1.5, function()
+			self.FirearmGui.Crosshair.Visible = false
+		end))
+	end
+
+	
+	--if self.HitMarkerIteration == nil then self.HitMarkerIteration = 0 end
+	--self.HitMarkerIteration += 1
+	--local MyIteration = self.HitMarkerIteration
+
+	--Util("Tween", self.FirearmGui.HitMarker, 0.1, "Sine", "Out", {
+	--	Size = UDim2.fromScale(0.048, 0.048),
+	--}):Play()
+	--self.SubTrove:Add(task.delay(0.6, function()
+	--	if MyIteration == self.HitMarkerIteration then
+	--		Util("Tween", self.FirearmGui.HitMarker, 0.2, "Sine", "Out", {
+	--			Size = UDim2.fromScale(0, 0),
+	--		}):Play()
+	--	end
+	--end))
+end
+
+
+function Handler:DamageIndicator(ShooterPosition)
+	if Player.Character == nil then return end
+	if Player.Character:FindFirstChild("HumanoidRootPart") == nil then return end
+	
+	local MyPos =  Player.Character.HumanoidRootPart.CFrame
+	local ProjectedVector = MyPos:PointToObjectSpace(ShooterPosition) * Vector3.new(1, 0, 1)
+	self.FirearmGui.DamageIndicator.Rotation = math.deg(math.atan2(ProjectedVector.Z, ProjectedVector.X)) - 90
+	
+	Util("Tween", self.FirearmGui.DamageIndicator.Icon, 0.2, "Sine", "Out", {
+		ImageTransparency = 0.3
+	}):Play()
+	self.SubTrove:Add(task.delay(1.5, function()
+		Util("Tween", self.FirearmGui.DamageIndicator.Icon, 0.35, "Sine", "Out", {
+			ImageTransparency = 1
+		}):Play()
+	end))
+end
+
+
+function Handler:UpdateAmmoBar()
+	self.FirearmGui.AmmoBar.TextLabel.Text = "Ammo ".. self.Ammo .. "/".. self.FirearmConfig.Ammo
+	self.FirearmGui.AmmoBar.Bar.Size = UDim2.fromScale(self.Ammo/self.FirearmConfig.Ammo, 1)
+end
+
+
+function Handler:CreateFakeArms()
+	if self.FakeArms and self.FakeArms.Parent ~= nil then return end
+	self.CameraMode = nil
+	
+	for i,Part in pairs(self.Instance:GetDescendants()) do
+		if Part:IsA("BasePart") == false then continue end
+		if Part:GetAttribute("OrigTransparency") == nil then
+			Part:SetAttribute("OrigTransparency", Part.Transparency)
+		end
+	end
+	
+	Player.Character.Archivable = true
+	self.FakeArms = Player.Character:Clone()
+	Player.Character.Archivable = false
+	self.SubTrove:Add(self.FakeArms)
+	self.FakeArms.HumanoidRootPart.Anchored = true
+	for i,Obj in pairs(self.FakeArms.HumanoidRootPart:GetChildren()) do
+		if Obj.ClassName == "Beam" or Obj.ClassName == "ForceField" then
+			Obj:Destroy()
+		end
+	end
+	
+	local AntiGunDisappearPart = Instance.new("Part")
+	AntiGunDisappearPart.Name = "AntiGunDisappearPart"
+	AntiGunDisappearPart.Transparency = 0.99
+	AntiGunDisappearPart.CanCollide = false
+	AntiGunDisappearPart.Size = Vector3.new(1, 1, 1)
+	AntiGunDisappearPart.CFrame = self.FakeArms.Head.CFrame * CFrame.new(0, 0, -20)
+	Util("Weld", AntiGunDisappearPart, self.FakeArms.HumanoidRootPart)
+	AntiGunDisappearPart.Parent = self.FakeArms
+	
+	self.FakeArms.Head.Transparency = 1
+	for i,Obj in pairs(self.FakeArms:GetDescendants()) do
+		if Obj:IsA("Script") or Obj:IsA("Accessory") then
+			Obj:Destroy()
+		elseif Obj:IsA("BasePart") then
+			if Obj.Name == "HitBox" then Obj:Destroy() continue end
+			Obj.CanCollide = false
+			Obj.CollisionGroup = "FakeArms"
+		end
+	end
+	self.FakeArms.UpperTorso.Waist.C1 = CFrame.new(self.FakeArms.UpperTorso.Waist.C1.Position)
+	
+	
+	local FakeTool = self.FakeArms:FindFirstChildOfClass("Tool")
+	game:GetService("CollectionService"):RemoveTag(FakeTool, "Firearm")
+	FakeTool.Handle.CFrame = self.FakeArms.RightHand.CFrame * CFrame.new(0, -0.157, 0) * CFrame.Angles(-math.pi/2, 0, 0) * FakeTool.Grip:Inverse()
+	Util("Weld", self.FakeArms.RightHand, FakeTool.Handle)
+	for i,Part in pairs(FakeTool:GetDescendants()) do
+		if Part:IsA("BasePart") == false then continue end
+		Part.Transparency = Part:GetAttribute("OrigTransparency")
+	end
+
+	self.FakeArms.LeftUpperLeg:Destroy()
+	self.FakeArms.LeftLowerLeg:Destroy()
+	self.FakeArms.LeftFoot:Destroy()
+	self.FakeArms.RightUpperLeg:Destroy()
+	self.FakeArms.RightLowerLeg:Destroy()
+	self.FakeArms.RightFoot:Destroy()
+	
+	self.FakeArms.Parent = Camera
+	
+	
+	-- Equipped Animation
+	local FakeEquippedAnim = Instance.new("Animation")
+	FakeEquippedAnim.AnimationId = self.FirearmConfig.EquippedAnimId
+	local FakeEquippedTrack = self.FakeArms.Humanoid:LoadAnimation(FakeEquippedAnim)
+	FakeEquippedTrack:Play()
+	self.Anims["FakeEquippedTrack"] = FakeEquippedTrack
+	
+	-- Knockback Animation
+	local FakeKnockbackAnim = Instance.new("Animation")
+	FakeKnockbackAnim.AnimationId = self.FirearmConfig.KnockbackAnimId
+	local FakeKnockbackTrack = self.FakeArms.Humanoid:LoadAnimation(FakeKnockbackAnim)
+	self.Anims["FakeKnockbackTrack"] = FakeKnockbackTrack
+
+	-- Reloading Animation
+	local FakeReloadingAnim = Instance.new("Animation")
+	FakeReloadingAnim.AnimationId = self.FirearmConfig.ReloadingAnimId
+	local FakeReloadingTrack = self.FakeArms.Humanoid:LoadAnimation(FakeReloadingAnim)
+	self.Anims["FakeReloadingTrack"] = FakeReloadingTrack
+	
+	-- Grenade Throwing Animation
+	local FakeGrenadeThrowAnim = Instance.new("Animation")
+	FakeGrenadeThrowAnim.AnimationId = Config("Universe").GrenadeThrowAnimId
+	local FakeGrenadeThrowTrack = self.FakeArms.Humanoid:LoadAnimation(FakeGrenadeThrowAnim)
+	self.Anims["FakeGrenadeThrowTrack"] = FakeGrenadeThrowTrack
+	
+	self.Anims["FakeEquippedTrack"]:Play()
+	
+	-- Enters Third Person
+	local function ThirdPerson()
+		if self.CameraMode == "ThirdPerson" then return end
+		self.CameraMode = "ThirdPerson"
+		
+		if self.CameraTrove then
+			self.CameraTrove:Clean()
+		end
+		
+		self.FirearmGui.Crosshair.Visible = true
+		
+		self.FakeArms:PivotTo(CFrame.new(0, 99999, 0))
+		for i,Part in pairs(self.Instance:GetDescendants()) do
+			if Part:IsA("BasePart") == false then continue end
+			Part.Transparency = Part:GetAttribute("OrigTransparency")
+		end
+	end
+	
+	-- Enters First Person
+	local function FirstPerson()
+		if self.CameraMode == "FirstPerson" then return end
+		self.CameraMode = "FirstPerson"
+		self.CameraTrove = self.SubTrove:Extend()
+		
+		for i,Part in pairs(self.Instance:GetDescendants()) do
+			if Part:IsA("BasePart") == false then continue end
+			Part.Transparency = 1
+		end
+		
+		local HeadOffset = self.FakeArms.Head.CFrame:ToObjectSpace(self.FakeArms.HumanoidRootPart.CFrame)
+		local HRP = Player.Character.HumanoidRootPart
+		local ArmAnimation = "Normal"
+		self.CameraTrove:Connect(game:GetService("RunService").RenderStepped, function()
+			-- Player is Aiming
+			if self.Aiming == true then
+				if ArmAnimation == "Normal" or ArmAnimation == "ToNormal" then
+					ArmAnimation = "ToSights"
+					
+					if self.FirearmConfig.Scoped == true then
+						for i,Part in pairs(self.FakeArms:GetDescendants()) do
+							if Part:IsA("BasePart") == false then continue end
+							if Part.Name == "Head" then continue end
+							Util("Tween", Part, 0.2, "Sine", "Out", {
+								Transparency = 1,
+							}):Play()
+						end
+					end
+					
+					local S = os.clock()
+					local Length = 0.15
+					local Con; Con = self.CameraTrove:Connect(game:GetService("RunService").RenderStepped, function()
+						if ArmAnimation ~= "ToSights" then return end
+						if os.clock() >= S + Length then
+							Con:Disconnect()
+							ArmAnimation = "Sights"
+							return
+						end
+
+						local Percent = (os.clock() - S) / Length
+						local Alpha = game:GetService("TweenService"):GetValue(Percent, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+						local SightOffset = FakeTool.Sight.CFrame:ToObjectSpace(self.FakeArms.HumanoidRootPart.CFrame)
+						local NewPos = Camera.CFrame * HeadOffset
+						local Offset = (Camera.CFrame * HeadOffset):ToObjectSpace(Camera.CFrame * SightOffset)
+						NewPos *= CFrame.new():Lerp(Offset, Alpha)
+
+						self.FakeArms:PivotTo(NewPos)
+					end)
+					
+					
+				elseif ArmAnimation == "Sights" then
+					local SightOffset = FakeTool.Sight.CFrame:ToObjectSpace(self.FakeArms.HumanoidRootPart.CFrame)
+					self.FakeArms:PivotTo(Camera.CFrame * SightOffset)
+				end
+				
+				self.FirearmGui.Crosshair.Visible = false
+				
+			-- Player is not Aiming
+			else
+				if ArmAnimation == "Sights" or ArmAnimation == "ToSights" then
+					ArmAnimation = "ToNormal"
+					
+					if self.FirearmConfig.Scoped == true then
+						for i,Part in pairs(self.FakeArms:GetDescendants()) do
+							if Part:IsA("BasePart") == false then continue end
+							if Part.Name == "Head" then continue end
+							Util("Tween", Part, 0.2, "Sine", "Out", {
+								Transparency = Part:GetAttribute("OrigTransparency") or 0,
+							}):Play()
+						end
+					end
+					
+					local S = os.clock()
+					local Length = 0.15
+					local Con; Con = self.CameraTrove:Connect(game:GetService("RunService").RenderStepped, function()
+						if ArmAnimation ~= "ToNormal" then return end
+						if os.clock() >= S + Length then
+							Con:Disconnect()
+							ArmAnimation = "Normal"
+							return
+						end
+
+						local Percent = (os.clock() - S) / Length
+						local Alpha = game:GetService("TweenService"):GetValue(Percent, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+
+
+						local SightOffset = FakeTool.Sight.CFrame:ToObjectSpace(self.FakeArms.HumanoidRootPart.CFrame)
+						self.FakeArms:PivotTo((Camera.CFrame * SightOffset):Lerp(Camera.CFrame * HeadOffset, Alpha))
+					end)
+					
+				elseif ArmAnimation == "Normal" then
+					self.FakeArms:PivotTo(Camera.CFrame * HeadOffset)
+				end
+				
+				self.FirearmGui.Crosshair.Visible = true
+			end
+			
+			self.Anims["FakeEquippedTrack"]:AdjustSpeed(HRP.AssemblyLinearVelocity.Magnitude / 16)
+		end)
+	end
+	
+	local function UpdateCamMode()
+		if Player.Character.Head.LocalTransparencyModifier > 0.8 then
+			FirstPerson()
+		else
+			ThirdPerson()
+		end
+	end
+	self.SubTrove:Connect(Player.Character.Head:GetPropertyChangedSignal("LocalTransparencyModifier"), UpdateCamMode)
+	UpdateCamMode()
+end
+
+
+function Handler:CustomCamera()
+	local Humanoid = Player.Character:WaitForChild("Humanoid")
+	local HRP = Player.Character:WaitForChild("HumanoidRootPart")
+	
+	self.Anims["EquippedTrack"]:Play()
+	
+	if Player.Character:GetAttribute("SwitchedTools") == nil then
+		if Player:GetAttribute("Platform") == "Phone" or Player:GetAttribute("Platform") == "Tablet" then
+			Player.CameraMinZoomDistance = ZoomOnEquip[2]
+			Player.CameraMaxZoomDistance = ZoomOnEquip[2] + 1
+		else
+			Player.CameraMinZoomDistance = ZoomOnEquip[1]
+			Player.CameraMaxZoomDistance = ZoomOnEquip[1] + 1
+		end
+		task.defer(function()
+			Player.CameraMinZoomDistance = 0.5
+			Player.CameraMaxZoomDistance = 400
+		end)
+		Humanoid.CameraOffset = Vector3.new(0.5, 0.5, 0)
+	else
+		Util("Tween", Humanoid, 0.05, "Sine", "Out", {
+			CameraOffset = Humanoid.CameraOffset,
+		}):Play()
+	end
+	
+	UIS.MouseDeltaSensitivity = self.FirearmConfig.MouseSensitivity
+	Player.PlayerScripts.PlayerModule.CameraModule.MouseLockController.MouseLock:Fire(true)
+	
+	local CrouchHeight = 0
+	self.SubTrove:Connect(game:GetService("RunService").RenderStepped, function()
+		local Pitch, Yaw = Camera.CFrame:ToEulerAnglesYXZ()
+		local Percent = Pitch / 1.4
+		
+		if Humanoid:GetAttribute("Crouching") == true then
+			CrouchHeight = math.max(-1, CrouchHeight - 0.35)
+		else
+			CrouchHeight = math.min(0, CrouchHeight + 0.35)
+		end
+		
+		-- Looking Up
+		if Pitch > 0 then
+			local X = 0.5 + (-0.7 * Percent)
+			local Y = 1 + CrouchHeight + (-0.2 * Percent)
+			local Z = (2.4 * Percent)
+			Util("Tween", Humanoid, 0.05, "Sine", "Out", {
+				CameraOffset = Vector3.new(X, Y, Z),
+			}):Play()
+			
+		-- Looking Down
+		else
+			local X = 0.5 + (-0.1 * -Percent)
+			local Y = 1 + CrouchHeight + (-3 * -Percent)
+			local Z = (-1.5 * -Percent)
+			Util("Tween", Humanoid, 0.05, "Sine", "Out", {
+				CameraOffset = Vector3.new(X, Y, Z),
+			}):Play()
+		end
+		
+		local ForwardRotation = -1.7 * (Percent / 1.4)
+		local SideRotation = 0.2 + (-0.45 * (Pitch < 0 and Percent or -Percent / 1.4))
+		
+		if Humanoid.SeatPart ~= nil then
+			
+			SideRotation = SideRotation - Yaw
+			--SideRotation = SideRotation + math.rad(90)
+			local Pitch2, Yaw2 = Humanoid.SeatPart.CFrame:ToEulerAnglesYXZ()
+			
+			SideRotation = SideRotation + Yaw2
+		end
+		
+		if Player.Character then
+			if Player.Character:FindFirstChild("UpperTorso") and Player.Character.UpperTorso:FindFirstChild("Waist") then
+				Player.Character.UpperTorso.Waist.C1 = CFrame.Angles(ForwardRotation, SideRotation, 0) + Player.Character.UpperTorso.Waist.C1.Position
+			end
+		end
+		
+		self.Anims["EquippedTrack"]:AdjustSpeed(HRP.AssemblyLinearVelocity.Magnitude / 16)
+	end)																																					
+end
+
+
+function Handler:DetectFiring()
+	local FiringConnection
+
+	local function Fire()
+		if self.Shooter.Character.Humanoid.SeatPart ~= nil and self.Shooter.Character.Humanoid.SeatPart.Name ~= "SeatSWAT" then return end
+		if self.Ammo == 0 then return end
+		if self.Reloading == true then return end
+		if self.Shooter.Character.Humanoid.Health <= 0 then return end
+		if os.clock() - self.LastFire < self.FirearmConfig.FireRate then return end
+
+		self:Fire("Client")
+	end
+
+	-- User wants to shoot
+	self.SubTrove:Connect(UIS.InputBegan, function(Input, GP)
+		if GP == true then return end
+		if Input.UserInputType ~= Enum.UserInputType.MouseButton1 and Input.KeyCode ~= Enum.KeyCode.ButtonR2 then return end
+		if FiringConnection ~= nil then return end
+
+		if self.FirearmConfig.FiringType == "Auto" then
+			FiringConnection = self.SubTrove:Connect(game:GetService("RunService").Heartbeat, Fire)
+		else
+			Fire()
+		end
+	end)
+
+	-- User stopped pressing keys
+	self.SubTrove:Connect(UIS.InputEnded, function(Input, GP)
+		if Input.UserInputType ~= Enum.UserInputType.MouseButton1 and Input.KeyCode ~= Enum.KeyCode.ButtonR2 then return end
+		if FiringConnection == nil then return end
+		FiringConnection:Disconnect()
+		FiringConnection = nil
+	end)
+
+	-- Touchscreen Gui Connections
+	if Player:GetAttribute("TouchEnabled") == true then
+		self.FirearmGui.Touchscreen.FireButton.InputBegan:Connect(function(Input)
+			if FiringConnection ~= nil then return end
+			FiringConnection = self.SubTrove:Connect(game:GetService("RunService").Heartbeat, Fire)
+			
+			Input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+				if Input.UserInputState ~= Enum.UserInputState.End then return end
+				if FiringConnection == nil then return end
+				FiringConnection:Disconnect()
+				FiringConnection = nil
+				Input:Destroy()
+			end)
+		end)
+	end
+end
+
+
+function Handler:DetectOnSeated()
+	self.SubTrove:Connect(Player.Character.Humanoid.Seated, function()
+		if Player.Character.Humanoid.SeatPart ~= nil and Player.Character.Humanoid.SeatPart.Name ~= "SeatSWAT" then
+			Player.Character.Humanoid:UnequipTools()
+		end
+	end)
+end
+
+
+function Handler:DetectServerFiring()
+	self.SubTrove:Connect(Net:RemoteEvent("Fire").OnClientEvent, function(Tool, ...)
+		if self.Instance ~= Tool then return end
+		self:Fire("Server", ...)
+	end)
+	self.SubTrove:Connect(Net:RemoteEvent("LaunchFuel").OnClientEvent, function(Tool, ...)
+		if self.Instance ~= Tool then return end
+		self:Fire("Server", ...)
+	end)
+	self.SubTrove:Connect(Net:RemoteEvent("ThrowGrenadeAnimation").OnClientEvent, function(Tool, ...)
+		if self.Instance ~= Tool then return end
+		self:ThrowGrenadeAnimation(...)
+	end)
+	self.SubTrove:Connect(Net:RemoteEvent("ThrowGrenade").OnClientEvent, function(Tool, ...)
+		if self.Instance ~= Tool then return end
+		self:ThrowGrenade(...)
+	end)
+end
+
+
+function Handler:Fire(Entity, ...)
+	local Barrel = self.Instance.Barrel
+	-- If Shooter is calling this function
+	if Entity == "Client" then
+		-- Shooting through glitch walls check
+		local RaycastParamaters = RaycastParams.new()
+		RaycastParamaters.FilterType = Enum.RaycastFilterType.Exclude
+		local List = {}
+		for i,Part in pairs(Player.Character:GetDescendants()) do
+			if Part:IsA("BasePart") == false then continue end
+			if Part == Barrel then continue end
+			table.insert(List, Part)
+		end
+		RaycastParamaters.FilterDescendantsInstances = {List, self.FakeArms, self.DebrisFolder}
+		
+		local RaycastResult = game.Workspace:Raycast(Player.Character.Head.Position, (Barrel.Position - Player.Character.Head.Position).Unit * 3, RaycastParamaters)
+		if RaycastResult ~= nil and RaycastResult.Instance ~= Barrel then
+			return false
+		end
+
+		self.LastFire = os.clock()
+		self.Ammo -= 1
+		self:UpdateAmmoBar()
+		
+		if self.CameraMode == "FirstPerson" then
+			Barrel = self.FakeArms:FindFirstChildOfClass("Tool").Barrel
+		end
+		
+		if self.FirearmConfig.Name == "RPG" then
+			local PackedData, RocketDirections = require(script.CalculateRocketDirections)("Firearm", self.FirearmConfig, Barrel.Position, self.DebrisFolder, {Aiming = self.Aiming, CurrentSpread = self.CurrentSpread})
+			self.SubTrove:AddPromise(FirearmService:Fire(table.unpack(PackedData)))
+
+			self.SubTrove:AddPromise(require(script.AnimateRocket)("Client", "Firearm", self.FirearmConfig, RocketDirections, self.DebrisFolder):andThen(function(GrenadePos)
+				if GrenadePos == nil then return end
+				self.SubTrove:AddPromise(FirearmService:RPGHit(Barrel.Parent, GrenadePos.Position):andThen(function(GotAKill)
+					if GotAKill ~= true then return end
+
+					Util("NewSound", "PlayAndDestroy", {
+						SoundId = 10777800503,
+						Volume = 1,
+						Parent = Player.PlayerGui,
+					})
+
+					self.FirearmGui.HitMarker.Visible = true
+					self.SubTrove:Add(task.delay(0.4, function()
+						self.FirearmGui.HitMarker.Visible = false
+					end))
+				end))
+			end))
+
+			self.Instance.Grenade.Transparency = self.Ammo == 0 and 1 or 0
+			
+		elseif self.FirearmConfig.Name == "Flamethrower" then
+			local PackedData, FlameHits = require(script.CalculateFlameHits)("Firearm", self.FirearmConfig, self.DebrisFolder, {Aiming = self.Aiming, CurrentSpread = self.CurrentSpread})
+			require(script.AnimateFlame)("Client", "Firearm", self.FirearmConfig, Barrel.Position, FlameHits, self.DebrisFolder)
+			FirearmService:LaunchFuel(table.unpack(PackedData))
+			
+		else
+			local PackedData, BulletHits = require(script.CalculateBulletHit)("Firearm", self.FirearmConfig, Barrel.Position, self.DebrisFolder, {Aiming = self.Aiming, CurrentSpread = self.CurrentSpread})
+			require(script.AnimateBullet)("Client", "Firearm", self.FirearmConfig, Barrel.Position, BulletHits, self.DebrisFolder)
+
+			self.SubTrove:AddPromise(FirearmService:Fire(table.unpack(PackedData)):andThen(function(GotAKill)
+				if GotAKill ~= true then return end
+
+				Util("NewSound", "PlayAndDestroy", {
+					SoundId = 10777800503,
+					Volume = 1,
+					Parent = Player.PlayerGui,
+				})
+
+				self.FirearmGui.HitMarker.Visible = true
+				self.SubTrove:Add(task.delay(0.4, function()
+					self.FirearmGui.HitMarker.Visible = false
+				end))
+			end))
+		end
+		
+		self.CurrentSpread = math.min(self.FirearmConfig.Spread[2], self.CurrentSpread + self.FirearmConfig.SpreadIncreasePerSecond * self.FirearmConfig.FireRate)
+		
+		-- Camera Knockback
+		local Humanoid = Player.Character.Humanoid
+		local function MoveDown()
+			local S = os.clock()
+			local Length = 0.2
+			local PrevIncrement = 0
+			local Stepped; Stepped = self.SubTrove:Connect(game:GetService("RunService").RenderStepped, function()
+				local Percent = os.clock() >= S + Length and 1 or (os.clock() - S) / Length
+				local Alpha = game:GetService("TweenService"):GetValue(Percent, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+				local Knockback = self.FirearmConfig.CameraKnockback
+				if Humanoid:GetAttribute("Crouching") == true then
+					Knockback /= 3
+				end
+				local Increment = (-Knockback/1.8) * Alpha
+				local NewIncrement = Increment - PrevIncrement
+				PrevIncrement = Increment
+
+				Camera.CFrame *= CFrame.Angles(NewIncrement, 0, 0)
+
+				if Percent >= 1 then
+					Stepped:Disconnect()
+					if self.Ammo == 0 then self:Reload() return end
+				end
+			end)
+		end
+
+		local function MoveUp()
+			local S = os.clock()
+			local Length = 0.1
+			local PrevIncrement = 0
+			local Stepped; Stepped = self.SubTrove:Connect(game:GetService("RunService").RenderStepped, function()
+				local Percent = os.clock() >= S + Length and 1 or (os.clock() - S) / Length
+				local Alpha = game:GetService("TweenService"):GetValue(Percent, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+
+				local Knockback = self.FirearmConfig.CameraKnockback
+				if Humanoid:GetAttribute("Crouching") == true then
+					Knockback /= 3
+				end
+				local Increment = (Knockback) * Alpha
+				local NewIncrement = Increment - PrevIncrement
+				PrevIncrement = Increment
+
+				Camera.CFrame *= CFrame.Angles(NewIncrement, 0, 0)
+
+				if Percent >= 1 then
+					Stepped:Disconnect()
+					MoveDown()
+				end
+			end)
+		end
+		MoveUp()
+	elseif Entity == "Server" then
+		if self.FirearmConfig.Name == "RPG" then
+			local RocketDirections = ...
+			require(script.AnimateRocket)("Server", "Firearm", self.FirearmConfig, RocketDirections, self.DebrisFolder)
+		elseif self.FirearmConfig.Name == "Flamethrower" then
+			local FlameHits = ...
+			require(script.AnimateFlame)("Server", "Firearm", self.FirearmConfig, Barrel.Position, FlameHits, self.DebrisFolder)
+		else
+			local BulletHits = ...
+			require(script.AnimateBullet)("Server", "Firearm", self.FirearmConfig, Barrel.Position, BulletHits, self.DebrisFolder)
+		end
+	end
+	
+	if self.CameraMode == "FirstPerson" then
+		Barrel = self.FakeArms:FindFirstChildOfClass("Tool").Barrel
+	end
+	
+	-- Flash
+	local FlashPart = RepStorage.Misc.FlashPart:Clone()
+	game.Debris:AddItem(FlashPart, 0.1)
+	FlashPart.CFrame = Barrel.CFrame * CFrame.Angles(0, 0, Random.new():NextNumber(0, 6.28))
+	Util("Weld", FlashPart, Barrel)
+	FlashPart.BackFlash.Flash.Size = UDim2.new(0, 0, 0, 0)
+	Util("Tween", FlashPart.BackFlash.Flash, 0.08, "Sine", "Out", {
+		Size = UDim2.new(1, 0, 1, 0)
+	}):Play()
+	FlashPart.FrontFlash.Flash.Size = UDim2.new(0, 0, 0, 0)
+	Util("Tween", FlashPart.FrontFlash.Flash, 0.08, "Sine", "Out", {
+		Size = UDim2.new(1, 0, 1, 0)
+	}):Play()
+	FlashPart.Parent = self.DebrisFolder
+	
+	-- Knockback Animation
+	-- Character
+	if self.Shooter == Player then
+		self.Anims["KnockbackTrack"]:Play(0.1, self.FirearmConfig.KnockbackPercent)
+		self.Anims["FakeKnockbackTrack"]:Play(0.1, self.FirearmConfig.KnockbackPercent)
+	end
+	
+	if self.FirearmConfig.Name == "Flamethrower" then
+		local FlameReleaseSound = self.AudioFolder:FindFirstChild("FlameReleaseSound")
+		if FlameReleaseSound then
+			FlameReleaseSound.Volume = self.FirearmConfig.FireSoundVolume
+		else
+			local FlameReleaseSound = Util("NewSound", "PlayAndDestroy", {
+				Name = "FlameReleaseSound",
+				SoundId = self.FirearmConfig.FireSoundId,
+				Volume = self.FirearmConfig.FireSoundVolume,
+				Looped = true,
+				Parent = self.AudioFolder,
+			})
+			
+			local Interval = Timer.new(0.1)
+			self.SubTrove:Add(Interval)
+			Interval.Tick:Connect(function()
+				FlameReleaseSound.Volume -= 0.1
+				if FlameReleaseSound.Volume <= 0 then
+					Interval:Destroy()
+					FlameReleaseSound:Destroy()
+				end
+			end)
+			Interval:Start()
+		end
+		
+		local IgnitionEmitter = Barrel:FindFirstChild("IgnitonFlames")
+		if IgnitionEmitter then
+			IgnitionEmitter.Rate = 100
+		else
+			local IgnitionEmitter = RepStorage.Misc.IgnitionFlames:Clone()
+			self.SubTrove:Add(IgnitionEmitter)
+			IgnitionEmitter.Parent = Barrel
+			
+			local Interval = Timer.new(0.05)
+			self.SubTrove:Add(Interval)
+			Interval.Tick:Connect(function()
+				IgnitionEmitter.Rate -= 5
+				if IgnitionEmitter.Rate <= 0 then
+					Interval:Destroy()
+					IgnitionEmitter:Destroy()
+				end
+			end)
+			Interval:Start()
+		end
+	else
+		Util("NewSound", "PlayAndDestroy", {
+			SoundId = self.FirearmConfig.FireSoundId,
+			Volume = self.FirearmConfig.FireSoundVolume,
+			Parent = self.AudioFolder,
+		})
+	end
+end
+
+
+function Handler:Reload()
+	if self.Reloading == true then return end
+	if self.Ammo >= self.FirearmConfig.Ammo then return end
+	if self.Aiming == true and self.FirearmConfig.Scoped == false and Player:GetAttribute("TouchEnabled") == false then
+		self:Aim(false)
+	end
+	self.Reloading = true
+
+	FirearmService:Reload(self.Instance)
+	self.FirearmGui.AmmoBar.TextLabel.Text = "Reloading"
+	local AmmoBarTween = Util("Tween", self.FirearmGui.AmmoBar.Bar, self.FirearmConfig.ReloadTime, "Sine", "Out", {
+		Size = UDim2.new(1, 0, 1, 0),
+	})
+	AmmoBarTween:Play()
+
+	self.ReloadTrove:Add(function()
+		AmmoBarTween:Cancel()
+	end)
+	
+	self.Anims["ReloadingTrack"]:Play(0.1, 1, self.Anims["ReloadingTrack"].Length/self.FirearmConfig.ReloadTime)
+	self.Anims["FakeReloadingTrack"]:Play(0.1, 1, self.Anims["FakeReloadingTrack"].Length/self.FirearmConfig.ReloadTime)
+	
+	local Sound = Util("NewSound", "PlayAndDestroy", {
+		SoundId = self.FirearmConfig.ReloadSoundId,
+		Volume = self.FirearmConfig.ReloadSoundVolume,
+		Parent = self.AudioFolder,
+	})
+	if Sound then
+		self.ReloadTrove:Add(Sound)
+	end
+
+	self.ReloadTrove:Add(task.delay(self.FirearmConfig.ReloadTime, function()
+		self.Ammo = self.FirearmConfig.Ammo
+		self:UpdateAmmoBar()
+		if self.FirearmConfig.Name == "RPG" then
+			self.Instance.Grenade.Transparency = 0
+		end
+		self.Reloading = false
+	end))
+end
+
+
+function Handler:StopReloading()
+	self.ReloadTrove:Clean()
+	self:UpdateAmmoBar()
+	self.Reloading = false
+end
+
+
+function Handler:ThrowGrenade(ThrowPosition, Force)
+	local Grenade
+	if Player == self.Shooter then
+		Grenade = RepStorage.Misc.Grenade:Clone()
+		game.Debris:AddItem(Grenade, 60)
+		Grenade.CFrame = CFrame.new(self.Shooter.Character.LeftHand.Position, self.Shooter.Character.LeftHand.Position + (Camera.CFrame * CFrame.Angles(0.4, 0, 0)).LookVector)
+		Grenade.Mesh.Position = Grenade.Position
+		Grenade.Parent = game.Workspace
+
+		local Pitch = Camera.CFrame:ToEulerAnglesYXZ()
+		local Force = Pitch / 1.4
+		Force += 1
+		Force /= 2
+
+		local Force = game:GetService("TweenService"):GetValue(Force, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+		if self.Shooter.Character.Humanoid.FloorMaterial == Enum.Material.Air then
+			Force += 0.2
+		end
+		Grenade:ApplyImpulse(Grenade.CFrame.LookVector * 130 * Force)
+		FirearmService:ThrowGrenade(Grenade.Position + Grenade.CFrame.LookVector * 1000, Force)
+		
+	else
+		Grenade = RepStorage.Misc.Grenade:Clone()
+		game.Debris:AddItem(Grenade, 60)
+		Grenade.CFrame = CFrame.new(self.Shooter.Character.LeftHand.Position, ThrowPosition)
+		Grenade.Mesh.Position = Grenade.Position
+		Grenade.Parent = game.Workspace
+		
+		Grenade:ApplyImpulse(Grenade.CFrame.LookVector * 110 * Force)
+	end
+	
+	local Sound = Util("NewSound", "PlayAndDestroy", {
+		SoundId = Config("Universe").GrenadeThrowSoundId,
+		Volume = Config("Universe").GrenadeThrowSoundVolume,
+		Parent = self.AudioFolder,
+	})
+	if Sound then
+		self.GrenadeTrove:Add(Sound)
+	end
+	
+	task.delay(2, function()
+		if self.Shooter == Player then
+			FirearmService:ExplodeGrenade(self.Instance, Grenade.Position)
+		end
+		
+		local Explosion = Instance.new("Explosion")
+		Explosion.Position = Grenade.Position
+		Explosion.BlastRadius = 15
+		Explosion.BlastPressure = 0
+		Explosion.ExplosionType = Enum.ExplosionType.NoCraters
+		Explosion.DestroyJointRadiusPercent = 0
+		Explosion.Parent = game.Workspace
+		
+		local HitEffect = Grenade.HitEffect
+		local WorldPosition = HitEffect.WorldPosition
+		HitEffect.Parent = game.Workspace.Terrain
+		HitEffect.Position = WorldPosition
+		HitEffect.HitParticles:Emit(50)
+		if Player:GetAttribute("SFXEnabled") == true then
+			HitEffect:WaitForChild("HitSound"):Play()
+		end
+		
+		local ExplosionPosition = Grenade.Position
+		local ExpShake = require(RepStorage.KnitFolder.Shake).new()
+		ExpShake.Frequency = 0.1
+		ExpShake.Amplitude = 100
+		ExpShake.FadeInTime = 0
+		ExpShake.FadeOutTime = 0.25
+		ExpShake.SustainTime = 0.5
+		ExpShake.RotationInfluence = Vector3.new(0.1, 0.1, 0.1)
+		
+		local Head = game.Players.LocalPlayer.Character.Head
+		local RenderPriority = Enum.RenderPriority.Last.Value
+		ExpShake:BindToRenderStep("ExplosionShake", RenderPriority, function(Pos, Rot)
+			local Distance = (Head.Position - ExplosionPosition).Magnitude
+			local Intensity = Distance > 100 and 0 or (1 / (Distance * Distance / 4))
+			Pos *= Intensity
+			Rot *= Intensity
+			Camera.CFrame *= CFrame.new(Pos) * CFrame.Angles(Rot.X, Rot.Y, Rot.Z)
+		end)
+		ExpShake:Start()
+		
+		Grenade:Destroy()
+		
+		task.defer(function()
+			self:StopThrowingGrenade()
+		end)
+	end)
+end
+
+
+function Handler:ThrowGrenadeAnimation()
+	self.GrenadeTrove = self.SubTrove:Extend()
+	
+	if self.Shooter == Player then
+		self.GrenadeTrove:Connect(self.Anims["GrenadeThrowTrack"]:GetMarkerReachedSignal("GrenadeInHand"), function()
+			local Grenade = RepStorage.Misc.Grenade.Mesh:Clone()
+			self.GrenadeTrove:Add(Grenade)
+			Grenade.Name = "Grenade"
+			Grenade.CFrame = self.Shooter.Character.LeftHand.CFrame
+			Util("Weld", Grenade, self.Shooter.Character.LeftHand)
+			Grenade.Parent = self.Shooter.Character.LeftHand
+		end)
+		
+		self.GrenadeTrove:Connect(self.Anims["GrenadeThrowTrack"]:GetMarkerReachedSignal("ThrowGrenade"), function()
+			local Grenade = self.Shooter.Character.LeftHand:FindFirstChild("Grenade")
+			if Grenade then self.GrenadeTrove:Remove(Grenade) end
+			self:ThrowGrenade()
+		end)
+
+		self.Anims["GrenadeThrowTrack"]:Play()
+		self.Anims["FakeGrenadeThrowTrack"]:Play()
+		
+	else
+		self.GrenadeTrove:Add(task.delay(0.25, function()
+			local Grenade = RepStorage.Misc.Grenade.Mesh:Clone()
+			self.GrenadeTrove:Add(Grenade)
+			Grenade.Name = "Grenade"
+			Grenade.CFrame = self.Shooter.Character.LeftHand.CFrame
+			Util("Weld", Grenade, self.Shooter.Character.LeftHand)
+			Grenade.Parent = self.Shooter.Character.LeftHand
+		end))
+		
+		self.GrenadeTrove:Add(task.delay(0.96, function()
+			local Grenade = self.Shooter.Character.LeftHand:FindFirstChild("Grenade")
+			if Grenade then self.GrenadeTrove:Remove(Grenade) end
+		end))
+	end
+	
+	local Sound = Util("NewSound", "PlayAndDestroy", {
+		SoundId = Config("Universe").GrenadeUnpinSoundId,
+		Volume = Config("Universe").GrenadeUnpinSoundVolume,
+		Parent = self.AudioFolder,
+	})
+	if Sound then
+		self.GrenadeTrove:Add(Sound)
+	end
+end
+
+
+function Handler:ThrowGrenadeStart()
+	if self.ThrowingGrenade == true then return end
+	if self.Shooter.Character:GetAttribute("Grenades") == nil then
+		Knit.GetController("AlertController"):New("Go to gunshop to equip grenades 💣")
+		return
+	end
+	if self.Shooter.Character:GetAttribute("Grenades") <= 0 then return end
+	if self.Aiming == true and self.FirearmConfig.Scoped == true then
+		self:Aim(false)
+	end
+	self.ThrowingGrenade = true
+	self.Shooter.Character:SetAttribute("Grenades", self.Shooter.Character:GetAttribute("Grenades") - 1)
+	
+	FirearmService:ThrowGrenadeAnimation()
+	self:ThrowGrenadeAnimation()
+	
+	local GrenadeConfig = Util("GetConfig", "Grenades", 201)
+	self.GrenadeTrove:Add(task.delay(GrenadeConfig.ThrowingRate, function()
+		task.defer(function()
+			self:StopThrowingGrenade()
+		end)
+	end))
+end
+
+
+function Handler:StopThrowingGrenade()
+	if self.GrenadeTrove then
+		self.GrenadeTrove:Clean()
+		self.GrenadeTrove = nil
+	end
+	self.ThrowingGrenade = false
+end
+
+
+function Handler:Jump(Input)
+	self.FirearmGui.Touchscreen.JumpButton.ImageRectOffset = Vector2.new(146, 146)
+	
+	local JumpTimer = self.SubTrove:Connect(game:GetService("RunService").RenderStepped, function()
+		Player.Character.Humanoid.Jump = true
+	end)
+	
+	Input:GetPropertyChangedSignal("UserInputState"):Connect(function()
+		if Input.UserInputState == Enum.UserInputState.End then
+			JumpTimer:Disconnect()
+			self.FirearmGui.Touchscreen.JumpButton.ImageRectOffset = Vector2.new(1, 146)
+		end
+	end)
+end
+
+
+function Handler:DetectAIs()
+	local AIService = Knit.GetService("AIService")
+	self.SubTrove:Add(Timer.Simple(1, function()
+		for i,AI_Model in pairs(game.Workspace.AIs:GetChildren()) do
+			if AI_Model:FindFirstChild("HumanoidRootPart") == nil then continue end
+			
+			local Distance = (AI_Model.HumanoidRootPart.Position - Player.Character.HumanoidRootPart.Position).Magnitude
+			if Distance > 35 then continue end
+			
+			if Player.Character.HumanoidRootPart.CFrame.LookVector:Dot((AI_Model.HumanoidRootPart.Position - Player.Character.HumanoidRootPart.Position).Unit) > 0.9 then
+				local RaycastParamaters = RaycastParams.new()
+				RaycastParamaters.FilterType = Enum.RaycastFilterType.Exclude
+				RaycastParamaters.FilterDescendantsInstances = {Player.Character, self.FakeArms, self.DebrisFolder}
+
+				local RaycastResult = game.Workspace:Raycast(Player.Character.Head.Position, (AI_Model.Head.Position - Player.Character.Head.Position).Unit * 100, RaycastParamaters)
+				if RaycastResult ~= nil and RaycastResult.Instance:IsDescendantOf(AI_Model) == true then
+					AIService:AtGunpoint(AI_Model)
+				end
+			end
+		end
+	end))
+end
+
+return Handler
